@@ -78,6 +78,34 @@ async def link_web_auth_token(token: str, telegram_id: int, user_id: int) -> boo
     return True
 
 
+async def link_web_auth_token_to_user(token: str, user_id: int) -> bool:
+    """Link a web auth token directly to an already-known user_id.
+
+    Same handshake as link_web_auth_token(), used by flows that don't have
+    a Telegram identity (e.g. magic-link email login confirming itself
+    from a second, already-authenticated browser context).
+    """
+    key = cache_key(WEB_AUTH_PREFIX, token)
+    data: Any = await cache.get(key)
+
+    if not data or not isinstance(data, dict):
+        logger.warning('Web auth token not found or expired', token_prefix=token[:8])
+        return False
+
+    if data.get('status') != 'pending':
+        logger.warning('Web auth token already used', token_prefix=token[:8])
+        return False
+
+    data['status'] = 'linked'
+    data['user_id'] = user_id
+    data['linked_at'] = datetime.now(UTC).isoformat()
+
+    await cache.set(key, data, expire=WEB_AUTH_LINKED_TTL)
+
+    logger.info('Web auth token linked to user', token_prefix=token[:8], user_id=user_id)
+    return True
+
+
 async def poll_web_auth_token(token: str) -> dict[str, Any] | None:
     """Poll for web auth token status (non-destructive).
 

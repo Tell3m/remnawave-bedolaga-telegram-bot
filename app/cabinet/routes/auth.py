@@ -41,6 +41,7 @@ from app.services.web_auth_service import (
     WEB_AUTH_TOKEN_TTL,
     consume_web_auth_token,
     create_web_auth_token,
+    link_web_auth_token_to_user,
     poll_web_auth_token,
 )
 from app.utils.cache import RateLimitCache, TokenReplayCache
@@ -89,7 +90,10 @@ from ..schemas.auth import (
     EmailRegisterRequest,
     EmailRegisterStandaloneRequest,
     EmailVerifyRequest,
+    MagicLinkConfirmRequest,
+    MagicLinkPollRequest,
     MagicLinkRequest,
+    MagicLinkResponse,
     PasswordForgotRequest,
     PasswordResetRequest,
     RefreshTokenRequest,
@@ -1865,7 +1869,7 @@ async def auto_login(
 # --- Passwordless magic-link auth (primary email flow for the site) ---
 
 
-@router.post('/email/magic-link')
+@router.post('/email/magic-link', response_model=MagicLinkResponse)
 async def request_magic_link(
     request: MagicLinkRequest,
     raw_request: Request,
@@ -1877,6 +1881,14 @@ async def request_magic_link(
     for guest-purchase auto-login — this endpoint only handles the request
     (find-or-create user, mint token, email it). Always returns a generic
     success message to avoid email enumeration (mirrors /password/forgot).
+
+    Also mints a poll_token (same Redis handshake as the Telegram deeplink
+    flow) so the browser that REQUESTED the link can log itself in
+    automatically once the link is opened — possibly in a completely
+    different browser/device (e.g. the Mail app's in-app browser vs. an
+    iOS home-screen PWA icon), without that click needing to be the place
+    the user actually continues from. See /email/magic-link/poll and
+    /email/magic-link/confirm.
     """
     client_ip = get_client_ip(raw_request)
     if await RateLimitCache.is_ip_rate_limited(client_ip, 'magic_link_request', limit=5, window=60, fail_closed=True):
@@ -1897,7 +1909,7 @@ async def request_magic_link(
     if email_lower in {e.lower() for e in settings.get_admin_emails()}:
         # Admin accounts must use full Telegram/password auth — never a
         # passwordless link. Same generic response so this doesn't leak.
-        return {'message': 'If this email is valid, a login link has been sent'}
+        return MagicLinkResponse(message='If this email is valid, a login link has been sent')
 
     result = await db.execute(
         select(User).where(func.lower(User.email) == email_lower, User.status != UserStatus.DELETED.value)
@@ -1913,11 +1925,19 @@ async def request_magic_link(
         )
 
     if user.status != UserStatus.ACTIVE.value:
-        return {'message': 'If this email is valid, a login link has been sent'}
+        return MagicLinkResponse(message='If this email is valid, a login link has been sent')
 
     token = create_auto_login_token(user.id, ttl_hours=1)
+
+    try:
+        poll_token = await create_web_auth_token()
+    except RuntimeError:
+        poll_token = None
+
     cabinet_url = settings.CABINET_URL
     magic_url = f'{cabinet_url}/auto-login?token={token}'
+    if poll_token:
+        magic_url += f'&poll_token={poll_token}'
 
     if email_service.is_configured():
         lang = user.language or 'ru'
@@ -1929,7 +1949,79 @@ async def request_magic_link(
             f'<p>Ссылка действительна 1 час.</p>',
         )
 
-    return {'message': 'If this email is valid, a login link has been sent'}
+    return MagicLinkResponse(
+        message='If this email is valid, a login link has been sent',
+        poll_token=poll_token,
+    )
+
+
+@router.post('/email/magic-link/poll', response_model=AuthResponse)
+async def poll_magic_link(
+    request: MagicLinkPollRequest,
+    raw_request: Request,
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Poll for magic-link confirmation (mirrors /deeplink/poll exactly).
+
+    Returns 202 while the link hasn't been opened yet anywhere, AuthResponse
+    once /email/magic-link/confirm has linked it, 410 once expired/consumed.
+    """
+    client_ip = get_client_ip(raw_request)
+    if await RateLimitCache.is_ip_rate_limited(client_ip, 'magic_link_poll', limit=60, window=60, fail_closed=True):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail='Too many requests',
+            headers={'Retry-After': '60'},
+        )
+
+    data = await poll_web_auth_token(request.poll_token)
+
+    if data is None:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail='Token expired or not found')
+
+    if data.get('status') == 'pending':
+        raise HTTPException(status_code=status.HTTP_202_ACCEPTED, detail='Waiting for confirmation')
+
+    if data.get('status') != 'linked':
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail='Invalid token state')
+
+    consumed = await consume_web_auth_token(request.poll_token)
+    if not consumed:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail='Token already consumed')
+
+    user_id = consumed.get('user_id')
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Invalid token data')
+
+    user = await get_user_by_id(db, int(user_id))
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='User not found')
+
+    if user.status != UserStatus.ACTIVE.value:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Account is deactivated')
+
+    user.cabinet_last_login = datetime.now(UTC)
+    response = await _create_auth_response(user, db)
+    await _store_refresh_token(db, user.id, response.refresh_token)
+    await db.commit()
+
+    return response
+
+
+@router.post('/email/magic-link/confirm')
+async def confirm_magic_link(
+    request: MagicLinkConfirmRequest,
+    user: User = Depends(get_current_cabinet_user),
+):
+    """Called by the browser that just opened the emailed link (after its
+    own /login/auto succeeds) to unblock the requesting browser's poll.
+
+    Requires a valid access token from that just-completed login, so the
+    poll_token can only ever be linked to the account that actually proved
+    ownership of the email -- not an arbitrary caller-supplied user_id.
+    """
+    linked = await link_web_auth_token_to_user(request.poll_token, user.id)
+    return {'confirmed': linked}
 
 
 @router.post('/password/forgot')

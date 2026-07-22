@@ -104,6 +104,29 @@ class MagicLinkRequest(BaseModel):
     email: EmailStr = Field(..., description='Email address')
 
 
+class MagicLinkResponse(BaseModel):
+    """Response to a magic-link request -- poll_token lets the requesting
+    browser log itself in once the emailed link is opened anywhere."""
+
+    message: str
+    poll_token: str | None = Field(
+        None, description='Pass to /email/magic-link/poll to auto-login this browser'
+    )
+
+
+class MagicLinkPollRequest(BaseModel):
+    """Poll for magic-link confirmation from the requesting browser."""
+
+    poll_token: str = Field(..., max_length=128)
+
+
+class MagicLinkConfirmRequest(BaseModel):
+    """Called by the browser that actually opened the emailed link, to
+    unblock the original requesting browser's poll."""
+
+    poll_token: str = Field(..., max_length=128)
+
+
 class TokenResponse(BaseModel):
     """Token pair response."""
 
