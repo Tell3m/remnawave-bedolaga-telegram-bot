@@ -66,7 +66,7 @@ from ..auth.email_verification import (
     get_verification_expires_at,
     is_token_expired,
 )
-from ..auth.jwt_handler import get_refresh_token_expires_at
+from ..auth.jwt_handler import create_auto_login_token, get_refresh_token_expires_at
 from ..auth.merge_service import (
     clear_email_merge_otp,
     create_merge_token,
@@ -89,6 +89,7 @@ from ..schemas.auth import (
     EmailRegisterRequest,
     EmailRegisterStandaloneRequest,
     EmailVerifyRequest,
+    MagicLinkRequest,
     PasswordForgotRequest,
     PasswordResetRequest,
     RefreshTokenRequest,
@@ -1859,6 +1860,76 @@ async def auto_login(
     await db.commit()
 
     return response
+
+
+# --- Passwordless magic-link auth (primary email flow for the site) ---
+
+
+@router.post('/email/magic-link')
+async def request_magic_link(
+    request: MagicLinkRequest,
+    raw_request: Request,
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Email a one-time login link. Creates the account (passwordless) if new.
+
+    Reuses the auto_login JWT + /login/auto consumption path already built
+    for guest-purchase auto-login — this endpoint only handles the request
+    (find-or-create user, mint token, email it). Always returns a generic
+    success message to avoid email enumeration (mirrors /password/forgot).
+    """
+    client_ip = get_client_ip(raw_request)
+    if await RateLimitCache.is_ip_rate_limited(client_ip, 'magic_link_request', limit=5, window=60, fail_closed=True):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail='Too many requests',
+            headers={'Retry-After': '60'},
+        )
+
+    email_lower = (request.email or '').strip().lower()
+
+    if disposable_email_service.is_disposable(email_lower):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Disposable email addresses are not allowed',
+        )
+
+    if email_lower in {e.lower() for e in settings.get_admin_emails()}:
+        # Admin accounts must use full Telegram/password auth — never a
+        # passwordless link. Same generic response so this doesn't leak.
+        return {'message': 'If this email is valid, a login link has been sent'}
+
+    result = await db.execute(
+        select(User).where(func.lower(User.email) == email_lower, User.status != UserStatus.DELETED.value)
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        user = await create_user_by_email(
+            db=db,
+            email=email_lower,
+            password_hash=None,
+            first_name=None,
+            language='ru',
+        )
+
+    if user.status != UserStatus.ACTIVE.value:
+        return {'message': 'If this email is valid, a login link has been sent'}
+
+    token = create_auto_login_token(user.id, ttl_hours=1)
+    cabinet_url = settings.CABINET_URL
+    magic_url = f'{cabinet_url}/auto-login?token={token}'
+
+    if email_service.is_configured():
+        lang = user.language or 'ru'
+        await asyncio.to_thread(
+            email_service.send_email,
+            email_lower,
+            'Вход в HotSpot' if lang == 'ru' else 'Sign in to HotSpot',
+            f'<p>Перейдите по ссылке, чтобы войти в кабинет HotSpot:</p><p><a href="{magic_url}">{magic_url}</a></p>'
+            f'<p>Ссылка действительна 1 час.</p>',
+        )
+
+    return {'message': 'If this email is valid, a login link has been sent'}
 
 
 @router.post('/password/forgot')

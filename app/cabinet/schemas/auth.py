@@ -98,6 +98,12 @@ class AutoLoginRequest(BaseModel):
     token: str = Field(..., max_length=2048, description='Auto-login JWT token')
 
 
+class MagicLinkRequest(BaseModel):
+    """Request to email a passwordless login link."""
+
+    email: EmailStr = Field(..., description='Email address')
+
+
 class TokenResponse(BaseModel):
     """Token pair response."""
 
