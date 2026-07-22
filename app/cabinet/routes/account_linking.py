@@ -642,6 +642,57 @@ async def link_telegram(
             current_user_id=user.id,
             existing_user_id=existing_user.id,
         )
+
+        # Telegram identity takes priority over an email-only account that
+        # never held anything of value: if the CURRENT session has never had
+        # a balance or a paid subscription, there's nothing here the person
+        # would need to confirm losing, so merge immediately instead of
+        # surfacing the manual merge-preview screen. keep_subscription_from
+        # stays 'secondary' (the pre-existing Telegram account) so its plan
+        # wins over the account's own (at most trial) subscription on
+        # conflict. This keeps the CURRENT session's user_id as primary, so
+        # the caller's existing access token stays valid -- no new tokens to
+        # issue, unlike the manual merge endpoint.
+        if user.balance_kopeks == 0 and not user.has_had_paid_subscription:
+            deferred_deletions: list[str] = []
+            try:
+                await execute_merge(
+                    db=db,
+                    primary_user_id=user.id,
+                    secondary_user_id=existing_user.id,
+                    keep_subscription_from='secondary',
+                    provider='telegram',
+                    provider_id=str(telegram_id),
+                    deferred_remnawave_deletions=deferred_deletions,
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.exception(
+                    'Auto-merge into existing Telegram account failed, falling back to manual merge',
+                    user_id=user.id,
+                    existing_user_id=existing_user.id,
+                )
+            else:
+                await flush_remnawave_deletions(deferred_deletions)
+                try:
+                    from app.services.remnawave_resync_service import resync_user_subscriptions_with_panel
+
+                    await resync_user_subscriptions_with_panel(db, user)
+                except Exception as resync_error:
+                    logger.error(
+                        'Post-auto-merge resync failed (non-fatal)',
+                        user_id=user.id,
+                        error=resync_error,
+                    )
+                logger.info(
+                    'Telegram auto-merged into current session (email account had no balance/paid history)',
+                    user_id=user.id,
+                    existing_user_id=existing_user.id,
+                    telegram_id=telegram_id,
+                )
+                return LinkCallbackResponse(success=True, message='linked_auto_merged')
+
         merge_token = await create_merge_token(
             primary_user_id=user.id,
             secondary_user_id=existing_user.id,
