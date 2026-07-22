@@ -605,6 +605,12 @@ async def execute_merge(
                 primary_id=primary.id,
                 secondary_id=secondary.id,
             )
+        # BUG FIX: without this flush, an assignment made here can be silently
+        # discarded below (step 4) if the balance section's lock_user_for_update
+        # reloads primary/secondary with populate_existing=True -- that option
+        # force-overwrites in-memory attributes from the DB, and an unflushed
+        # ORM assignment isn't in the DB yet to be preserved by that reload.
+        await db.flush()
 
     # 2. Перенос telegram_id (unique constraint — тот же паттерн: очистка → flush → установка)
     if secondary.telegram_id and not primary.telegram_id:
@@ -617,6 +623,9 @@ async def execute_merge(
             primary_id=primary.id,
             secondary_id=secondary.id,
         )
+        # BUG FIX: see comment above -- must be flushed before step 4 can
+        # reload primary/secondary with populate_existing=True.
+        await db.flush()
 
     # 3. Перенос email + password (unique constraint на email — тот же паттерн)
     if not primary.email and secondary.email:
@@ -639,6 +648,9 @@ async def execute_merge(
             primary_id=primary.id,
             secondary_id=secondary.id,
         )
+        # BUG FIX: see comment above -- must be flushed before step 4 can
+        # reload primary/secondary with populate_existing=True.
+        await db.flush()
 
     # 4. Суммируем баланс (включая отрицательный — долг не должен исчезать)
     transferred_kopeks = secondary.balance_kopeks
