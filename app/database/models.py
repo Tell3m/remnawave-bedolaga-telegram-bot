@@ -1908,6 +1908,11 @@ class User(Base):
     updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now())
     last_activity = Column(AwareDateTime(), default=func.now())
     remnawave_uuid = Column(String(255), nullable=True, unique=True)
+    # Client-generated, localStorage-persisted device id captured at first
+    # site-trial claim -- lets a later claim from a DIFFERENT email but the
+    # SAME device be recognized, since a fresh email otherwise always creates
+    # a fresh User row with no subscription history to gate against.
+    site_trial_device_id = Column(String(64), nullable=True, index=True)
 
     # Cabinet authentication fields
     email = Column(String(255), unique=True, nullable=True, index=True)

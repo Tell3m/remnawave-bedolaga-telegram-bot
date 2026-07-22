@@ -34,6 +34,7 @@ from app.utils.cache import RateLimitCache
 
 from ..dependencies import get_cabinet_db
 from ..ip_utils import get_client_ip
+from .auth import _create_auth_response, _store_refresh_token
 
 
 logger = structlog.get_logger(__name__)
@@ -41,18 +42,28 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix='/public/site-trial', tags=['Cabinet:Public'])
 class SiteTrialClaimRequest(BaseModel):
     email: EmailStr = Field(..., description='Email address')
+    device_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description='Client-generated, localStorage-persisted device id (anti-abuse)',
+    )
 
 
 class SiteTrialClaimResponse(BaseModel):
-    status: str = Field(..., description='"activated" or "already_used"')
+    status: str = Field(..., description='"activated", "already_used" or "device_limit"')
     message: str
     subscription_url: str | None = None
     happ_crypto_link: str | None = None
     expires_at: str | None = None
     traffic_limit_gb: int | None = None
+    access_token: str | None = None
+    refresh_token: str | None = None
+    expires_in: int | None = None
 
 
-async def _get_or_create_site_trial_user(db: AsyncSession, email_lower: str) -> User:
+async def _get_or_create_site_trial_user(
+    db: AsyncSession, email_lower: str, device_id: str | None
+) -> tuple[User, bool]:
     result = await db.execute(
         select(User)
         .options(selectinload(User.subscriptions))
@@ -60,7 +71,7 @@ async def _get_or_create_site_trial_user(db: AsyncSession, email_lower: str) -> 
     )
     user = result.scalar_one_or_none()
     if user:
-        return user
+        return user, False
 
     user = await create_user_by_email(
         db=db,
@@ -69,8 +80,30 @@ async def _get_or_create_site_trial_user(db: AsyncSession, email_lower: str) -> 
         first_name=None,
         language='ru',
     )
+    if device_id:
+        user.site_trial_device_id = device_id
+        await db.commit()
     await db.refresh(user, ['subscriptions'])
-    return user
+    return user, True
+
+
+async def _find_device_trial_conflict(db: AsyncSession, device_id: str, email_lower: str) -> User | None:
+    """Another (non-deleted) user already tied to this device id, if any.
+
+    Used to catch the same physical device claiming the trial again under a
+    different email -- ``User.is_trial_already_used()`` alone can't see this
+    because a fresh email always produces a fresh, subscription-less User row.
+    """
+    result = await db.execute(
+        select(User)
+        .options(selectinload(User.subscriptions))
+        .where(
+            User.site_trial_device_id == device_id,
+            User.status != UserStatus.DELETED.value,
+            func.lower(User.email) != email_lower,
+        )
+    )
+    return result.scalars().first()
 @router.post('/claim', response_model=SiteTrialClaimResponse)
 async def claim_site_trial(
     request: SiteTrialClaimRequest,
@@ -99,7 +132,17 @@ async def claim_site_trial(
     if settings.TRIAL_DURATION_DAYS <= 0 or settings.is_trial_disabled_for_user('email'):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Trial is not available')
 
-    user = await _get_or_create_site_trial_user(db, email_lower)
+    device_id = request.device_id.strip() if request.device_id else None
+
+    if device_id:
+        device_conflict = await _find_device_trial_conflict(db, device_id, email_lower)
+        if device_conflict and device_conflict.is_trial_already_used():
+            return SiteTrialClaimResponse(
+                status='device_limit',
+                message='Trial already claimed on this device',
+            )
+
+    user, _created = await _get_or_create_site_trial_user(db, email_lower, device_id)
 
     if user.status != UserStatus.ACTIVE.value:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Account is not active')
@@ -144,6 +187,12 @@ async def claim_site_trial(
     await db.refresh(subscription)
     logger.info('Site trial activated', user_id=user.id, email=email_lower, subscription_id=subscription.id)
 
+    # Issue a token pair so the site can silently refresh this visitor's real
+    # subscription status on later visits (see /auth/refresh) instead of
+    # caching the claim-time snapshot forever.
+    auth_response = await _create_auth_response(user, db)
+    await _store_refresh_token(db, user.id, auth_response.refresh_token, device_info='site_trial')
+
     return SiteTrialClaimResponse(
         status='activated',
         message='Trial activated',
@@ -151,4 +200,7 @@ async def claim_site_trial(
         happ_crypto_link=subscription.subscription_crypto_link,
         expires_at=subscription.end_date.isoformat() if subscription.end_date else None,
         traffic_limit_gb=subscription.traffic_limit_gb,
+        access_token=auth_response.access_token,
+        refresh_token=auth_response.refresh_token,
+        expires_in=auth_response.expires_in,
     )
