@@ -63,6 +63,7 @@ class EmailNotificationTemplates:
             NotificationType.EMAIL_VERIFICATION: self._email_verification_template,
             NotificationType.PASSWORD_RESET: self._password_reset_template,
             NotificationType.EMAIL_CHANGE_CODE: self._email_change_code_template,
+            NotificationType.SITE_TRIAL_CODE: self._site_trial_code_template,
             NotificationType.GUEST_SUBSCRIPTION_DELIVERED: self._guest_subscription_delivered_template,
             NotificationType.GUEST_ACTIVATION_REQUIRED: self._guest_activation_required_template,
             NotificationType.GUEST_GIFT_RECEIVED: self._guest_gift_received_template,
@@ -1491,6 +1492,68 @@ class EmailNotificationTemplates:
                 {code_box}
                 <p>این کد تا {expire_minutes} دقیقه معتبر است.</p>
                 <p style="color: #666;">اگر شما درخواست تغییر ایمیل نداده‌اید، این ایمیل را نادیده بگیرید.</p>
+            """,
+        }
+
+        return {
+            'subject': subjects.get(language, subjects['ru']),
+            'body_html': self._get_base_template(bodies.get(language, bodies['ru']), language),
+        }
+
+    def _site_trial_code_template(self, language: str, context: dict[str, Any]) -> dict[str, str]:
+        """Template for the site (recovery portal) trial verification code."""
+        code = html.escape(str(context.get('code', '')))
+        expire_minutes = context.get('expire_minutes', 10)
+
+        subjects = {
+            'ru': 'Код подтверждения для пробной подписки HotSpot VPN',
+            'en': 'Your HotSpot VPN trial verification code',
+            'zh': 'HotSpot VPN 试用验证码',
+            'ua': 'Код підтвердження для пробної підписки HotSpot VPN',
+            'fa': 'کد تایید اشتراک آزمایشی HotSpot VPN',
+        }
+
+        code_box = f"""
+                <div class="highlight" style="text-align: center;">
+                    <p style="font-size: 32px; font-weight: bold; letter-spacing: 8px; font-family: monospace; margin: 10px 0;">{code}</p>
+                </div>
+        """
+
+        bodies = {
+            'ru': f"""
+                <h2>Здравствуйте!</h2>
+                <p>Вы запросили пробную подписку HotSpot VPN на сайте. Введите код ниже, чтобы подтвердить эту почту и получить доступ:</p>
+                {code_box}
+                <p>Код действителен в течение {expire_minutes} минут.</p>
+                <p style="color: #666;">Если вы не запрашивали пробную подписку, просто проигнорируйте это письмо.</p>
+            """,
+            'en': f"""
+                <h2>Hello!</h2>
+                <p>You requested a HotSpot VPN trial on the website. Enter the code below to confirm this email and get access:</p>
+                {code_box}
+                <p>This code will expire in {expire_minutes} minutes.</p>
+                <p style="color: #666;">If you didn't request a trial, you can safely ignore this email.</p>
+            """,
+            'zh': f"""
+                <h2>您好！</h2>
+                <p>您在网站上请求了 HotSpot VPN 试用。请使用以下验证码确认此邮箱并获取访问权限：</p>
+                {code_box}
+                <p>此验证码将在 {expire_minutes} 分钟后过期。</p>
+                <p style="color: #666;">如果您没有请求试用，请忽略此邮件。</p>
+            """,
+            'ua': f"""
+                <h2>Вітаємо!</h2>
+                <p>Ви запросили пробну підписку HotSpot VPN на сайті. Введіть код нижче, щоб підтвердити цю пошту та отримати доступ:</p>
+                {code_box}
+                <p>Код дійсний протягом {expire_minutes} хвилин.</p>
+                <p style="color: #666;">Якщо ви не запитували пробну підписку, просто проігноруйте цей лист.</p>
+            """,
+            'fa': f"""
+                <h2>سلام!</h2>
+                <p>شما یک اشتراک آزمایشی HotSpot VPN را در وب‌سایت درخواست داده‌اید. برای تایید این ایمیل و دریافت دسترسی، از کد زیر استفاده کنید:</p>
+                {code_box}
+                <p>این کد تا {expire_minutes} دقیقه معتبر است.</p>
+                <p style="color: #666;">اگر شما درخواست اشتراک آزمایشی نداده‌اید، این ایمیل را نادیده بگیرید.</p>
             """,
         }
 

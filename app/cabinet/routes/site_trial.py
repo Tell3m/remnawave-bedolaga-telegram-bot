@@ -7,12 +7,25 @@ exact subscription-creation path the bot's trial button uses
 (create_trial_subscription + SubscriptionService.create_remnawave_user) and
 the same eligibility gate (User.is_trial_already_used()), so a site-claimed
 trial counts against the same one-trial-per-account limit as everywhere
-else — no separate abuse bookkeeping to maintain.
+else -- no separate abuse bookkeeping to maintain.
 
-Intentionally unauthenticated — mirrors the pattern in site_verification.py.
+Two-step flow (request-code / verify-code): entering an email alone used to
+be enough to activate a trial immediately. That let anyone type an email
+they don't own, and (worse) a visitor who simply cleared browser storage
+got a fresh client-generated device_id, silently defeating the device-based
+anti-abuse check on a *second* claim from the *same* physical device. A
+6-digit emailed code (same generator/compare pattern as the cabinet's
+email-change and email-merge OTP flows, just Redis-keyed by email instead
+of by an authenticated user id) now gates activation, proving the visitor
+actually controls the inbox before any subscription is created.
+
+Intentionally unauthenticated -- mirrors the pattern in site_verification.py.
 """
 
 from __future__ import annotations
+
+import asyncio
+import hmac
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -21,6 +34,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.cabinet.auth.email_verification import generate_email_change_code
+from app.cabinet.auth.site_trial_otp import (
+    SITE_TRIAL_OTP_TTL_SECONDS,
+    clear_site_trial_otp,
+    get_site_trial_otp,
+    store_site_trial_otp,
+)
+from app.cabinet.services.email_service import email_service
 from app.config import settings
 from app.database.crud.server_squad import get_random_trial_squad_uuid
 from app.database.crud.subscription import create_trial_subscription
@@ -40,7 +61,11 @@ from .auth import _create_auth_response, _store_refresh_token
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix='/public/site-trial', tags=['Cabinet:Public'])
-class SiteTrialClaimRequest(BaseModel):
+
+DEVICE_LIMIT_MESSAGE = 'Похоже, с этого устройства уже активировали пробную подписку. Купите подписку 😊'
+
+
+class SiteTrialRequestCodeRequest(BaseModel):
     email: EmailStr = Field(..., description='Email address')
     device_id: str | None = Field(
         default=None,
@@ -49,8 +74,27 @@ class SiteTrialClaimRequest(BaseModel):
     )
 
 
+class SiteTrialRequestCodeResponse(BaseModel):
+    status: str = Field(..., description='"code_sent", "already_used" or "device_limit"')
+    message: str
+    expires_in_minutes: int | None = None
+
+
+class SiteTrialVerifyCodeRequest(BaseModel):
+    email: EmailStr = Field(..., description='Email address')
+    code: str = Field(..., min_length=6, max_length=6, pattern=r'^\d{6}$', description='6-digit verification code')
+    device_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description='Client-generated, localStorage-persisted device id (anti-abuse)',
+    )
+
+
 class SiteTrialClaimResponse(BaseModel):
-    status: str = Field(..., description='"activated", "already_used" or "device_limit"')
+    status: str = Field(
+        ...,
+        description='"activated", "already_used", "device_limit", "invalid_code" or "expired_code"',
+    )
     message: str
     subscription_url: str | None = None
     happ_crypto_link: str | None = None
@@ -61,15 +105,19 @@ class SiteTrialClaimResponse(BaseModel):
     expires_in: int | None = None
 
 
-async def _get_or_create_site_trial_user(
-    db: AsyncSession, email_lower: str, device_id: str | None
-) -> tuple[User, bool]:
+async def _lookup_user_by_email(db: AsyncSession, email_lower: str) -> User | None:
     result = await db.execute(
         select(User)
         .options(selectinload(User.subscriptions))
         .where(func.lower(User.email) == email_lower, User.status != UserStatus.DELETED.value)
     )
-    user = result.scalar_one_or_none()
+    return result.scalar_one_or_none()
+
+
+async def _get_or_create_site_trial_user(
+    db: AsyncSession, email_lower: str, device_id: str | None
+) -> tuple[User, bool]:
+    user = await _lookup_user_by_email(db, email_lower)
     if user:
         return user, False
 
@@ -104,43 +152,140 @@ async def _find_device_trial_conflict(db: AsyncSession, device_id: str, email_lo
         )
     )
     return result.scalars().first()
-@router.post('/claim', response_model=SiteTrialClaimResponse)
-async def claim_site_trial(
-    request: SiteTrialClaimRequest,
+
+
+def _validate_claim_prerequisites(email: str) -> None:
+    if disposable_email_service.is_disposable(email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Disposable email addresses are not allowed',
+        )
+
+    if email.strip().lower() in {e.lower() for e in settings.get_admin_emails()}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='This email address cannot be used')
+
+    if settings.TRIAL_DURATION_DAYS <= 0 or settings.is_trial_disabled_for_user('email'):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Trial is not available')
+
+
+@router.post('/request-code', response_model=SiteTrialRequestCodeResponse)
+async def request_site_trial_code(
+    request: SiteTrialRequestCodeRequest,
     raw_request: Request,
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Claim the standard trial subscription for an email, no bot/cabinet needed."""
+    """Mail a 6-digit code proving inbox ownership before a trial can be claimed."""
     client_ip = get_client_ip(raw_request)
-    if await RateLimitCache.is_ip_rate_limited(client_ip, 'site_trial_claim', limit=5, window=3600, fail_closed=True):
+    if await RateLimitCache.is_ip_rate_limited(
+        client_ip, 'site_trial_request_code', limit=5, window=3600, fail_closed=True
+    ):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail='Too many requests',
             headers={'Retry-After': '3600'},
         )
 
-    if disposable_email_service.is_disposable(request.email):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='Disposable email addresses are not allowed',
-        )
-
+    _validate_claim_prerequisites(request.email)
     email_lower = request.email.strip().lower()
-    if email_lower in {e.lower() for e in settings.get_admin_emails()}:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='This email address cannot be used')
 
-    if settings.TRIAL_DURATION_DAYS <= 0 or settings.is_trial_disabled_for_user('email'):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Trial is not available')
+    if await RateLimitCache.is_rate_limited(
+        email_lower, 'site_trial_request_code_email', limit=3, window=3600, fail_closed=True
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail='Too many requests for this email',
+            headers={'Retry-After': '3600'},
+        )
 
     device_id = request.device_id.strip() if request.device_id else None
 
+    # Fail fast on device abuse -- no point mailing a code that verification
+    # will refuse to honour anyway.
     if device_id:
         device_conflict = await _find_device_trial_conflict(db, device_id, email_lower)
         if device_conflict and device_conflict.is_trial_already_used():
-            return SiteTrialClaimResponse(
-                status='device_limit',
-                message='Trial already claimed on this device',
-            )
+            return SiteTrialRequestCodeResponse(status='device_limit', message=DEVICE_LIMIT_MESSAGE)
+
+    existing_user = await _lookup_user_by_email(db, email_lower)
+    if existing_user and existing_user.is_trial_already_used():
+        return SiteTrialRequestCodeResponse(status='already_used', message='Trial already used for this email')
+
+    code = generate_email_change_code()
+    await store_site_trial_otp(email_lower, code, device_id)
+
+    expire_minutes = SITE_TRIAL_OTP_TTL_SECONDS // 60
+    sent = await asyncio.to_thread(
+        email_service.send_site_trial_code,
+        to_email=email_lower,
+        code=code,
+        expire_minutes=expire_minutes,
+        language='ru',
+    )
+    if not sent:
+        await clear_site_trial_otp(email_lower)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='Failed to send verification email',
+        )
+
+    logger.info('Site trial OTP sent', email=email_lower)
+    return SiteTrialRequestCodeResponse(
+        status='code_sent',
+        message='Verification code sent',
+        expires_in_minutes=expire_minutes,
+    )
+
+
+@router.post('/verify-code', response_model=SiteTrialClaimResponse)
+async def verify_site_trial_code(
+    request: SiteTrialVerifyCodeRequest,
+    raw_request: Request,
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Verify the emailed code and, if it matches, activate the trial subscription."""
+    client_ip = get_client_ip(raw_request)
+    if await RateLimitCache.is_ip_rate_limited(
+        client_ip, 'site_trial_verify_code', limit=8, window=600, fail_closed=True
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail='Too many requests',
+            headers={'Retry-After': '600'},
+        )
+
+    email_lower = request.email.strip().lower()
+
+    if await RateLimitCache.is_rate_limited(
+        email_lower, 'site_trial_verify_code_email', limit=5, window=900, fail_closed=True
+    ):
+        # Burn the pending code so a brute-force run can't keep grinding it --
+        # same lockout idiom as the cabinet's email-change/merge OTP flows.
+        await clear_site_trial_otp(email_lower)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail='Too many attempts, request a new code',
+            headers={'Retry-After': '900'},
+        )
+
+    otp = await get_site_trial_otp(email_lower)
+    if not otp:
+        return SiteTrialClaimResponse(
+            status='expired_code',
+            message='Code expired or was never requested, please request a new one',
+        )
+
+    if not hmac.compare_digest(str(otp.get('code', '')), request.code):
+        return SiteTrialClaimResponse(status='invalid_code', message='Invalid verification code')
+
+    device_id = (request.device_id.strip() if request.device_id else None) or otp.get('device_id')
+    await clear_site_trial_otp(email_lower)
+
+    # Re-check device abuse at activation time too (defense in depth against
+    # a second tab/device racing the same email through request-code).
+    if device_id:
+        device_conflict = await _find_device_trial_conflict(db, device_id, email_lower)
+        if device_conflict and device_conflict.is_trial_already_used():
+            return SiteTrialClaimResponse(status='device_limit', message=DEVICE_LIMIT_MESSAGE)
 
     user, _created = await _get_or_create_site_trial_user(db, email_lower, device_id)
 
@@ -149,6 +294,7 @@ async def claim_site_trial(
 
     if user.is_trial_already_used():
         return SiteTrialClaimResponse(status='already_used', message='Trial already used for this email')
+
     trial_squad_uuid = await get_random_trial_squad_uuid(db)
     trial_squads = [trial_squad_uuid] if trial_squad_uuid else []
 

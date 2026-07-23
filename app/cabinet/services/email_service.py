@@ -299,6 +299,44 @@ class EmailService:
             return False
         return self.send_email(to_email, *rendered)
 
+    def send_site_trial_code(
+        self,
+        to_email: str,
+        code: str,
+        expire_minutes: int,
+        language: str = 'ru',
+        custom_subject: str | None = None,
+        custom_body_html: str | None = None,
+    ) -> bool:
+        """
+        Send the site (recovery portal) trial verification code.
+
+        Args:
+            to_email: Address the visitor entered on the site
+            code: 6-digit verification code
+            expire_minutes: Minutes until the code expires
+            language: Language code (ru, en, zh, ua, fa)
+            custom_subject: Override subject from admin template
+            custom_body_html: Override body HTML from admin template
+
+        Returns:
+            True if email was sent successfully, False otherwise
+        """
+        if custom_subject and custom_body_html:
+            return self.send_email(to_email, custom_subject, custom_body_html)
+
+        rendered = self._render_default_template(
+            'site_trial_code',
+            language,
+            {
+                'code': code,
+                'expire_minutes': expire_minutes,
+            },
+        )
+        if not rendered:
+            return False
+        return self.send_email(to_email, *rendered)
+
 
 # Singleton instance
 email_service = EmailService()
