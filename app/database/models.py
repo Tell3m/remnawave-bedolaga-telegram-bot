@@ -1913,6 +1913,11 @@ class User(Base):
     # SAME device be recognized, since a fresh email otherwise always creates
     # a fresh User row with no subscription history to gate against.
     site_trial_device_id = Column(String(64), nullable=True, index=True)
+    # Open-source FingerprintJS visitorId -- recomputed fresh from device/
+    # browser characteristics on every visit rather than stored client-side,
+    # so (unlike site_trial_device_id) it survives a localStorage/cookie
+    # clear. See _compute_abuse_signal_count in site_trial.py.
+    site_trial_fingerprint = Column(String(64), nullable=True, index=True)
 
     # Cabinet authentication fields
     email = Column(String(255), unique=True, nullable=True, index=True)

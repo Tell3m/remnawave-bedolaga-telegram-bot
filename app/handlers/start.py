@@ -9,8 +9,11 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cabinet.auth.merge_service import consume_merge_token, create_merge_token
+from app.cabinet.auth.site_telegram_link import clear_site_telegram_link_token, get_site_telegram_link_token
 from app.config import settings
 from app.database.crud.campaign import (
     get_campaign_by_id,
@@ -20,6 +23,7 @@ from app.database.crud.subscription import decrement_subscription_server_counts
 from app.database.crud.user import (
     create_user,
     find_phantom_user_by_username,
+    get_user_by_id,
     get_user_by_referral_code,
     get_user_by_telegram_id,
 )
@@ -39,6 +43,7 @@ from app.middlewares.channel_checker import (
     delete_pending_payload_from_redis,
     get_pending_payload_from_redis,
 )
+from app.services.account_merge_service import execute_merge, flush_remnawave_deletions
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.campaign_service import AdvertisingCampaignService
 from app.services.channel_subscription_service import channel_subscription_service
@@ -60,6 +65,7 @@ from app.services.support_settings_service import SupportSettingsService
 from app.services.web_auth_service import WEB_AUTH_TOKEN_MIN_LENGTH, link_web_auth_token
 from app.states import RegistrationStates
 from app.utils.user_utils import generate_unique_referral_code
+from app.utils.validators import sanitize_telegram_name
 
 
 logger = structlog.get_logger(__name__)
@@ -848,6 +854,112 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
                 await message.answer('❌ Сначала зарегистрируйтесь в боте, затем попробуйте войти в кабинет.')
             return
         start_parameter = None  # Invalid token, ignore
+
+    # Handle site email-verification handoff: /start link_{token}.
+    #
+    # The recovery-portal site (yaw.hsfmvps.shop) proves email ownership
+    # itself (OTP code) before minting this token -- see
+    # app/cabinet/routes/site_trial.py's /telegram-link-token. Two cases:
+    #   - this Telegram id has no local account yet -> attach it directly
+    #     onto the site's email User row (skips the whole rules/language/
+    #     referral registration FSM below entirely -- there is nothing left
+    #     to collect, the row already exists and is active).
+    #   - this Telegram id already has a DIFFERENT existing account -> never
+    #     silently overwrite anything; offer an explicit merge confirmation
+    #     (same account_merge_service.execute_merge already used by the
+    #     cabinet's own account-linking merge flow).
+    # Always consumed as a one-shot -- never falls through to be treated as
+    # a referral code or campaign parameter either way.
+    if start_parameter and start_parameter.startswith('link_'):
+        link_token = start_parameter.removeprefix('link_')
+        start_parameter = None
+
+        if len(link_token) >= 16:
+            token_data = await get_site_telegram_link_token(link_token)
+            if not token_data:
+                await message.answer('❌ Ссылка для привязки почты истекла. Попробуйте ещё раз с сайта.')
+            else:
+                existing_user = db_user or await get_user_by_telegram_id(db, message.from_user.id)
+
+                if (
+                    existing_user
+                    and existing_user.status != UserStatus.DELETED.value
+                    and existing_user.id != token_data['user_id']
+                ):
+                    # Returning bot user under a different account already --
+                    # ask before touching anything.
+                    await clear_site_telegram_link_token(link_token)
+                    merge_token = await create_merge_token(
+                        primary_user_id=existing_user.id,
+                        secondary_user_id=token_data['user_id'],
+                        provider='site_email',
+                        provider_id=token_data['email'],
+                    )
+                    texts = get_texts(existing_user.language)
+                    keyboard = types.InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                types.InlineKeyboardButton(
+                                    text=texts.t('SITE_LINK_CONFIRM_YES', '✅ Да, привязать'),
+                                    callback_data=f'link_merge_confirm:{merge_token}',
+                                ),
+                                types.InlineKeyboardButton(
+                                    text=texts.t('SITE_LINK_CONFIRM_NO', '❌ Нет'),
+                                    callback_data='link_merge_deny',
+                                ),
+                            ],
+                        ]
+                    )
+                    await message.answer(
+                        texts.t(
+                            'SITE_LINK_CONFIRM_PROMPT',
+                            '🔗 Обнаружили подтверждённую почту {email} — привязать её к этому Telegram-аккаунту?',
+                        ).format(email=token_data['email']),
+                        reply_markup=keyboard,
+                    )
+                    return  # wait for the button, don't fall into registration below
+
+                if not existing_user:
+                    target_user = await get_user_by_id(db, token_data['user_id'])
+                    if not target_user or target_user.status == UserStatus.DELETED.value:
+                        await clear_site_telegram_link_token(link_token)
+                        await message.answer('❌ Ссылка для привязки почты больше не действительна.')
+                    else:
+                        await clear_site_telegram_link_token(link_token)
+                        target_user.telegram_id = message.from_user.id
+                        target_user.username = message.from_user.username
+                        target_user.first_name = sanitize_telegram_name(message.from_user.first_name)
+                        target_user.last_name = sanitize_telegram_name(message.from_user.last_name)
+                        target_user.status = UserStatus.ACTIVE.value
+                        if not target_user.referral_code:
+                            target_user.referral_code = await generate_unique_referral_code(
+                                db, message.from_user.id
+                            )
+                        target_user.updated_at = datetime.now(UTC)
+                        target_user.last_activity = datetime.now(UTC)
+                        try:
+                            await db.commit()
+                            texts = get_texts(target_user.language)
+                            await message.answer(
+                                texts.t(
+                                    'SITE_LINK_ATTACHED',
+                                    '✅ Telegram привязан к аккаунту {email}. Добро пожаловать!',
+                                ).format(email=token_data['email'])
+                            )
+                            # Falls through to the normal "active user found"
+                            # branch below (re-fetches by telegram_id, now
+                            # resolves to target_user) -- shows the standard
+                            # main menu for free instead of duplicating it.
+                        except IntegrityError:
+                            await db.rollback()
+                            logger.warning(
+                                'IntegrityError attaching telegram_id to site email user',
+                                target_user_id=token_data['user_id'],
+                                telegram_id=message.from_user.id,
+                            )
+                            await message.answer('❌ Не получилось привязать почту, попробуйте ещё раз с сайта.')
+                # else: existing_user.id == token_data['user_id'] -- already
+                # attached (link opened twice) -- nothing to do, fall through.
 
     # Handle contests deep link: /start contests — the channel announcement's
     # "🎲 Играть" button opens the bot here (a callback button can't open a
@@ -2919,6 +3031,74 @@ async def process_webauth_confirm(
         )
 
 
+async def process_link_merge_confirm(
+    callback: types.CallbackQuery,
+    db: AsyncSession,
+):
+    """Confirm/deny attaching a site-verified email onto this Telegram account.
+
+    See the `link_` branch in cmd_start -- reached only when this Telegram
+    id already had a different existing account, so the merge needs an
+    explicit yes/no rather than happening silently.
+    """
+    await callback.answer()
+
+    if not isinstance(callback.message, types.Message):
+        return
+
+    if callback.data == 'link_merge_deny':
+        await callback.message.edit_text('❌ Привязка отменена.')
+        return
+
+    merge_token = callback.data.split(':', 1)[1] if ':' in callback.data else ''
+    if not merge_token:
+        await callback.message.edit_text('❌ Ошибка: неверный токен.')
+        return
+
+    merge_data = await consume_merge_token(merge_token)
+    if not merge_data:
+        await callback.message.edit_text('❌ Ссылка для привязки истекла. Попробуйте ещё раз с сайта.')
+        return
+
+    primary_user = await get_user_by_telegram_id(db, callback.from_user.id)
+    if not primary_user or primary_user.id != merge_data.get('primary_user_id'):
+        # A different Telegram account pressed the button than the one the
+        # prompt was shown to -- refuse rather than merge into the wrong account.
+        await callback.message.edit_text('❌ Эта привязка предназначена для другого аккаунта.')
+        return
+
+    texts = get_texts(primary_user.language)
+    deferred_deletions: list[str] = []
+    try:
+        await execute_merge(
+            db,
+            primary_user_id=merge_data['primary_user_id'],
+            secondary_user_id=merge_data['secondary_user_id'],
+            provider=merge_data.get('provider'),
+            provider_id=merge_data.get('provider_id'),
+            deferred_remnawave_deletions=deferred_deletions,
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            'Site-email merge failed',
+            primary_user_id=merge_data.get('primary_user_id'),
+            secondary_user_id=merge_data.get('secondary_user_id'),
+        )
+        await callback.message.edit_text(
+            texts.t('SITE_LINK_MERGE_FAILED', '❌ Не получилось привязать почту. Попробуйте ещё раз позже.'),
+        )
+        return
+
+    await flush_remnawave_deletions(deferred_deletions)
+
+    email = merge_data.get('provider_id') or ''
+    await callback.message.edit_text(
+        texts.t('SITE_LINK_MERGE_SUCCESS', '✅ Почта {email} привязана к этому аккаунту.').format(email=email),
+    )
+
+
 def register_handlers(dp: Dispatcher):
     logger.debug('=== НАЧАЛО регистрации обработчиков start.py ===')
 
@@ -2968,5 +3148,11 @@ def register_handlers(dp: Dispatcher):
         F.data.startswith('webauth_confirm:') | F.data.in_(['webauth_deny']),
     )
     logger.debug('Зарегистрирован process_webauth_confirm')
+
+    dp.callback_query.register(
+        process_link_merge_confirm,
+        F.data.startswith('link_merge_confirm:') | F.data.in_(['link_merge_deny']),
+    )
+    logger.debug('Зарегистрирован process_link_merge_confirm')
 
     logger.debug('=== КОНЕЦ регистрации обработчиков start.py ===')
