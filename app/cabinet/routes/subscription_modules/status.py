@@ -22,6 +22,7 @@ from app.config import settings
 from app.database.crud.tariff import get_tariff_by_id
 from app.database.models import ServerSquad, User
 from app.services.remnawave_service import RemnaWaveService
+from app.services.subscription_service import SubscriptionService
 from app.services.system_settings_service import bot_configuration_service
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
@@ -58,6 +59,27 @@ async def get_subscription(
     if not subscription:
         # Return 200 with has_subscription: false instead of 404
         return SubscriptionStatusResponse(has_subscription=False, subscription=None)
+
+    # Pull live usage from the RemnaWave panel before responding -- this
+    # endpoint used to just read whatever traffic_used_gb was last written
+    # by the (disabled-by-default) background sync job, so it could sit
+    # stale indefinitely. The Mini App's own subscription view already
+    # does this same live sync on every load (see webapi/routes/miniapp.py);
+    # the cabinet -- and the recovery-portal site, which calls this exact
+    # endpoint -- had no equivalent, which is why traffic shown there could
+    # lag noticeably behind the VPN client's own live counter.
+    params = settings.get_remnawave_auth_params()
+    if params.get('base_url') and params.get('api_key'):
+        try:
+            usage_synced = await SubscriptionService().sync_subscription_usage(db, subscription)
+        except Exception as sync_error:
+            logger.warning('Failed to sync subscription usage for cabinet view', error=sync_error)
+            usage_synced = False
+        if usage_synced:
+            try:
+                await db.refresh(subscription, attribute_names=['traffic_used_gb', 'updated_at'])
+            except Exception as refresh_error:
+                logger.debug('Failed to refresh subscription after usage sync', error=refresh_error)
 
     # Load tariff for daily subscription check and tariff name
     tariff_name = None

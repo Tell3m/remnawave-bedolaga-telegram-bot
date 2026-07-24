@@ -3617,6 +3617,34 @@ class CabinetRefreshToken(Base):
         return f'<CabinetRefreshToken id={self.id} user_id={self.user_id} status={status}>'
 
 
+class WebAuthnCredential(Base):
+    """A registered passkey (Face ID/Touch ID/Windows Hello) for the site's
+    passwordless login -- see app/cabinet/routes/site_trial.py's
+    /webauthn/* endpoints. One row per registered authenticator; a single
+    user can have several (e.g. one per device that registered a passkey).
+    credential_id is what the browser sends back on login to find this row
+    (base64url, per the WebAuthn spec); public_key/sign_count are what the
+    `webauthn` library needs to verify each subsequent assertion.
+    """
+
+    __tablename__ = 'webauthn_credentials'
+    __table_args__ = (Index('ix_webauthn_credentials_user', 'user_id'),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    credential_id = Column(String(255), unique=True, nullable=False, index=True)
+    public_key = Column(Text, nullable=False)
+    sign_count = Column(Integer, default=0, nullable=False)
+    device_label = Column(String(120), nullable=True)
+    created_at = Column(AwareDateTime(), default=func.now())
+    last_used_at = Column(AwareDateTime(), nullable=True)
+
+    user = relationship('User', backref='webauthn_credentials')
+
+    def __repr__(self) -> str:
+        return f'<WebAuthnCredential id={self.id} user_id={self.user_id}>'
+
+
 # ==================== FORTUNE WHEEL ====================
 
 

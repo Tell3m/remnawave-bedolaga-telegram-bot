@@ -1915,6 +1915,20 @@ async def request_magic_link(
         select(User).where(func.lower(User.email) == email_lower, User.status != UserStatus.DELETED.value)
     )
     user = result.scalar_one_or_none()
+
+    if user and settings.is_admin(telegram_id=user.telegram_id, email=email_lower):
+        # Same block, but for an existing account whose *Telegram* id is
+        # an admin (ADMIN_IDS) even though this email was never itself
+        # listed in ADMIN_EMAILS -- e.g. an admin who later linked a
+        # personal email to their Telegram account (exactly this site's
+        # own Telegram-linking feature). The email-only check above can't
+        # catch this since it runs before the user row -- and therefore
+        # their telegram_id -- is known. Without this, the link would be
+        # emailed successfully every time but always fail at /login/auto,
+        # so a stale-token background resync could keep re-sending it
+        # indefinitely with no way for the admin to ever actually log in.
+        return MagicLinkResponse(message='If this email is valid, a login link has been sent')
+
     if not user:
         user = await create_user_by_email(
             db=db,

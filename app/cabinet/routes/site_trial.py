@@ -41,14 +41,24 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import secrets
+from datetime import UTC, datetime
 
 import structlog
+import webauthn
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
+from webauthn.helpers.structs import (
+    AuthenticatorSelectionCriteria,
+    PublicKeyCredentialDescriptor,
+    ResidentKeyRequirement,
+    UserVerificationRequirement,
+)
 
 from app.cabinet.auth.email_verification import generate_email_change_code
 from app.cabinet.auth.site_telegram_link import SITE_TELEGRAM_LINK_TTL_SECONDS, store_site_telegram_link_token
@@ -59,12 +69,20 @@ from app.cabinet.auth.site_trial_otp import (
     get_site_trial_otp,
     store_site_trial_otp,
 )
+from app.cabinet.auth.webauthn_challenge import (
+    clear_login_challenge,
+    clear_registration_challenge,
+    get_login_challenge,
+    get_registration_challenge,
+    store_login_challenge,
+    store_registration_challenge,
+)
 from app.cabinet.services.email_service import email_service
 from app.config import settings
 from app.database.crud.server_squad import get_random_trial_squad_uuid
 from app.database.crud.subscription import create_trial_subscription, get_subscription_by_user_id
 from app.database.crud.user import create_user_by_email, get_user_by_id
-from app.database.models import CabinetRefreshToken, User, UserStatus
+from app.database.models import CabinetRefreshToken, User, UserStatus, WebAuthnCredential
 from app.services.disposable_email_service import disposable_email_service
 from app.services.remnawave_service import RemnaWaveConfigurationError
 from app.services.subscription_service import SubscriptionService
@@ -86,6 +104,15 @@ DEVICE_LIMIT_MESSAGE = 'Похоже, с этого устройства уже 
 
 # Signals must be independently corroborated -- see module docstring.
 ABUSE_SIGNAL_BLOCK_THRESHOLD = 2
+
+# WebAuthn (Face ID/Touch ID/Windows Hello) is scoped to this one static
+# site's own origin -- the passkey is created and used by the *browser*
+# while it's showing yaw.hsfmvps.shop, regardless of which domain hosts
+# this API. RP ID must be the site's bare domain (no scheme/port); origin
+# is the full https:// URL the browser reports in the ceremony.
+SITE_WEBAUTHN_RP_ID = 'yaw.hsfmvps.shop'
+SITE_WEBAUTHN_RP_NAME = 'HotSpot'
+SITE_WEBAUTHN_ORIGIN = 'https://yaw.hsfmvps.shop'
 
 
 class SiteTrialRequestCodeRequest(BaseModel):
@@ -142,6 +169,11 @@ class SiteTrialClaimResponse(BaseModel):
     access_token: str | None = None
     refresh_token: str | None = None
     expires_in: int | None = None
+    # Only populated by /webauthn/login-complete -- every other caller of
+    # this response already knows the email itself (it's whatever the
+    # visitor just typed), but passkey login is deliberately usernameless,
+    # so this is the frontend's only way to learn whose session it just got.
+    email: str | None = None
 
 
 async def _lookup_user_by_email(db: AsyncSession, email_lower: str) -> User | None:
@@ -607,4 +639,261 @@ async def create_site_telegram_link_token(
     return SiteTelegramLinkResponse(
         start_param=f'link_{token}',
         expires_in_minutes=SITE_TELEGRAM_LINK_TTL_SECONDS // 60,
+    )
+
+
+# --- WebAuthn (Face ID/Touch ID/Windows Hello) -----------------------------
+#
+# Fixes a specific gap OTP/magic-link can't: adding this site to the iOS
+# home screen puts it in a *different* storage partition than Safari, so a
+# visitor who already verified their email gets asked for it again with
+# nothing about their account actually having changed. A passkey lives in
+# the device's Keychain instead of site storage, so it survives that (and
+# a plain "clear browser data") the same way it survives on any other site.
+#
+# Two ceremonies, each a "begin" (mint a challenge) + "complete" (verify
+# whatever the browser's navigator.credentials.* call produced) pair:
+#   - register: only reachable with an already-valid site session (must
+#     have logged in via OTP first) -- this adds a *second* way into an
+#     account that's already been proven, it never creates one.
+#   - login: deliberately usernameless/"discoverable" (empty
+#     allow_credentials) -- the whole point is skipping the email step
+#     entirely, so there's nothing to key the challenge to yet. If several
+#     passkeys exist for this site on one device, the OS's own picker
+#     handles disambiguation; whichever credential comes back tells us
+#     exactly which account, via credential_id -> WebAuthnCredential.user_id.
+
+
+def _label_from_user_agent(user_agent: str | None) -> str | None:
+    if not user_agent:
+        return None
+    for needle, label in (
+        ('iPhone', 'iPhone'),
+        ('iPad', 'iPad'),
+        ('Android', 'Android'),
+        ('Macintosh', 'Mac'),
+        ('Windows', 'Windows'),
+    ):
+        if needle in user_agent:
+            return label
+    return None
+
+
+class WebAuthnRegisterBeginRequest(BaseModel):
+    refresh_token: str = Field(..., description="The site session's refresh token (from request/verify-code)")
+
+
+class WebAuthnRegisterBeginResponse(BaseModel):
+    options: dict
+    challenge_token: str
+
+
+@router.post('/webauthn/register-begin', response_model=WebAuthnRegisterBeginResponse)
+async def webauthn_register_begin(
+    request: WebAuthnRegisterBeginRequest,
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Mint a registration challenge for the already-logged-in visitor.
+
+    Same refresh-token validation as /cabinet-handoff and
+    /telegram-link-token (this IS the site's session, not a new
+    credential) -- see those endpoints' docstrings for why.
+    """
+    payload = get_token_payload(request.refresh_token, expected_type='refresh')
+    if not payload:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Invalid or expired session')
+
+    try:
+        user_id = int(payload.get('sub'))
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Invalid token payload') from error
+
+    token_hash = hashlib.sha256(request.refresh_token.encode()).hexdigest()
+    result = await db.execute(
+        select(CabinetRefreshToken).where(
+            CabinetRefreshToken.token_hash == token_hash,
+            CabinetRefreshToken.revoked_at.is_(None),
+        )
+    )
+    token_record = result.scalar_one_or_none()
+    if not token_record or not token_record.is_valid:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Session no longer valid')
+
+    user = await get_user_by_id(db, user_id)
+    if not user or user.status != UserStatus.ACTIVE.value:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Account not active')
+
+    existing = await db.execute(select(WebAuthnCredential).where(WebAuthnCredential.user_id == user.id))
+    exclude_credentials = [
+        PublicKeyCredentialDescriptor(id=base64url_to_bytes(cred.credential_id))
+        for cred in existing.scalars().all()
+    ]
+
+    options = webauthn.generate_registration_options(
+        rp_id=SITE_WEBAUTHN_RP_ID,
+        rp_name=SITE_WEBAUTHN_RP_NAME,
+        user_id=str(user.id).encode(),
+        user_name=user.email or f'user-{user.id}',
+        user_display_name=user.email or f'user-{user.id}',
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            resident_key=ResidentKeyRequirement.REQUIRED,
+            user_verification=UserVerificationRequirement.REQUIRED,
+        ),
+        exclude_credentials=exclude_credentials or None,
+    )
+
+    challenge_token = secrets.token_urlsafe(24)
+    await store_registration_challenge(challenge_token, user.id, bytes_to_base64url(options.challenge))
+
+    return WebAuthnRegisterBeginResponse(
+        options=json.loads(webauthn.helpers.options_to_json(options)),
+        challenge_token=challenge_token,
+    )
+
+
+class WebAuthnRegisterCompleteRequest(BaseModel):
+    challenge_token: str
+    credential: dict
+
+
+class WebAuthnRegisterCompleteResponse(BaseModel):
+    status: str
+
+
+@router.post('/webauthn/register-complete', response_model=WebAuthnRegisterCompleteResponse)
+async def webauthn_register_complete(
+    request: WebAuthnRegisterCompleteRequest,
+    raw_request: Request,
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    challenge_data = await get_registration_challenge(request.challenge_token)
+    if not challenge_data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Registration challenge expired')
+    await clear_registration_challenge(request.challenge_token)
+
+    try:
+        verified = webauthn.verify_registration_response(
+            credential=request.credential,
+            expected_challenge=base64url_to_bytes(challenge_data['challenge']),
+            expected_rp_id=SITE_WEBAUTHN_RP_ID,
+            expected_origin=SITE_WEBAUTHN_ORIGIN,
+            require_user_verification=True,
+        )
+    except Exception as error:
+        logger.warning('WebAuthn registration verification failed', error=str(error))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Could not verify passkey') from error
+
+    credential = WebAuthnCredential(
+        user_id=challenge_data['user_id'],
+        credential_id=bytes_to_base64url(verified.credential_id),
+        public_key=bytes_to_base64url(verified.credential_public_key),
+        sign_count=verified.sign_count,
+        device_label=_label_from_user_agent(raw_request.headers.get('user-agent')),
+    )
+    db.add(credential)
+    await db.commit()
+
+    return WebAuthnRegisterCompleteResponse(status='registered')
+
+
+class WebAuthnLoginBeginResponse(BaseModel):
+    options: dict
+    challenge_token: str
+
+
+@router.post('/webauthn/login-begin', response_model=WebAuthnLoginBeginResponse)
+async def webauthn_login_begin(raw_request: Request):
+    client_ip = get_client_ip(raw_request)
+    if await RateLimitCache.is_ip_rate_limited(client_ip, 'site_webauthn_login', limit=20, window=60, fail_closed=True):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail='Too many requests',
+            headers={'Retry-After': '60'},
+        )
+
+    # No allow_credentials -- usernameless/discoverable: the OS shows
+    # whichever passkeys it has for this RP ID and picks for us.
+    options = webauthn.generate_authentication_options(
+        rp_id=SITE_WEBAUTHN_RP_ID,
+        user_verification=UserVerificationRequirement.REQUIRED,
+    )
+
+    challenge_token = secrets.token_urlsafe(24)
+    await store_login_challenge(challenge_token, bytes_to_base64url(options.challenge))
+
+    return WebAuthnLoginBeginResponse(
+        options=json.loads(webauthn.helpers.options_to_json(options)),
+        challenge_token=challenge_token,
+    )
+
+
+class WebAuthnLoginCompleteRequest(BaseModel):
+    challenge_token: str
+    credential: dict
+
+
+@router.post('/webauthn/login-complete', response_model=SiteTrialClaimResponse)
+async def webauthn_login_complete(
+    request: WebAuthnLoginCompleteRequest,
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    challenge_data = await get_login_challenge(request.challenge_token)
+    if not challenge_data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Login challenge expired')
+    await clear_login_challenge(request.challenge_token)
+
+    credential_id = request.credential.get('id')
+    if not credential_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Malformed credential')
+
+    result = await db.execute(select(WebAuthnCredential).where(WebAuthnCredential.credential_id == credential_id))
+    cred_row = result.scalar_one_or_none()
+    if not cred_row:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Passkey not recognized')
+
+    try:
+        verified = webauthn.verify_authentication_response(
+            credential=request.credential,
+            expected_challenge=base64url_to_bytes(challenge_data['challenge']),
+            expected_rp_id=SITE_WEBAUTHN_RP_ID,
+            expected_origin=SITE_WEBAUTHN_ORIGIN,
+            credential_public_key=base64url_to_bytes(cred_row.public_key),
+            credential_current_sign_count=cred_row.sign_count,
+            require_user_verification=True,
+        )
+    except Exception as error:
+        logger.warning('WebAuthn login verification failed', error=str(error))
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Could not verify passkey') from error
+
+    cred_row.sign_count = verified.new_sign_count
+    cred_row.last_used_at = datetime.now(UTC)
+
+    user = await get_user_by_id(db, cred_row.user_id)
+    if not user or user.status != UserStatus.ACTIVE.value or not user.email:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Account not active')
+
+    subscription = await get_subscription_by_user_id(db, user.id)
+    await db.commit()
+
+    if not subscription:
+        return SiteTrialClaimResponse(status='already_used', message='No active subscription for this account')
+
+    logger.info('Site login via passkey', user_id=user.id, email=user.email)
+    auth_response = await _create_auth_response(user, db)
+    await _store_refresh_token(db, user.id, auth_response.refresh_token, device_info='site_webauthn_login')
+
+    return SiteTrialClaimResponse(
+        status='activated',
+        message='Login confirmed',
+        subscription_url=subscription.subscription_url,
+        happ_crypto_link=subscription.subscription_crypto_link,
+        expires_at=subscription.end_date.isoformat() if subscription.end_date else None,
+        traffic_limit_gb=subscription.traffic_limit_gb,
+        traffic_used_gb=subscription.traffic_used_gb,
+        is_trial=subscription.is_trial,
+        tariff_name=subscription.tariff.name if subscription.tariff else None,
+        access_token=auth_response.access_token,
+        refresh_token=auth_response.refresh_token,
+        expires_in=auth_response.expires_in,
+        email=user.email,
     )
