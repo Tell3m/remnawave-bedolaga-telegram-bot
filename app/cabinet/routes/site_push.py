@@ -90,6 +90,7 @@ class SiteNotificationListRequest(BaseModel):
 class SiteNotificationListResponse(BaseModel):
     items: list[SiteNotificationItem]
     unread_count: int
+    push_enabled: bool
 
 
 @router.post('/notifications/list', response_model=SiteNotificationListResponse)
@@ -107,6 +108,17 @@ async def list_site_notifications(
     )
     rows = result.scalars().all()
 
+    # Ground truth for "is push on", used by the bell button instead of
+    # trusting the browser -- Notification.permission and localStorage
+    # were both observed drifting/resetting across iOS standalone-PWA
+    # relaunches even while push kept arriving, because delivery only
+    # depends on this server-side row, not on anything the JS layer
+    # can see reliably in that context.
+    push_result = await db.execute(
+        select(PushSubscription.id).where(PushSubscription.user_id == user_id).limit(1)
+    )
+    push_enabled = push_result.scalar_one_or_none() is not None
+
     return SiteNotificationListResponse(
         items=[
             SiteNotificationItem(
@@ -121,6 +133,7 @@ async def list_site_notifications(
             for row in rows
         ],
         unread_count=sum(1 for row in rows if row.read_at is None),
+        push_enabled=push_enabled,
     )
 
 
