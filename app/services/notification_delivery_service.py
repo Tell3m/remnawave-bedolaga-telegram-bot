@@ -162,6 +162,12 @@ class NotificationDeliveryService:
             logger.debug('Пропускаем уведомление для неактивного пользователя', user_id=user.id, status=user.status)
             return False
 
+        # Fire-and-forget fan-out to the site bell + Web Push -- independent
+        # of which branch below actually handles this user (Telegram and
+        # site push are not mutually exclusive, see docstring), and must
+        # never slow down or fail the primary delivery attempted below.
+        asyncio.create_task(self._maybe_send_site_notification(user, notification_type, context))
+
         if user.telegram_id:
             # User has Telegram - send via bot
             return await self._send_telegram_notification(
@@ -200,6 +206,35 @@ class NotificationDeliveryService:
             return False
         logger.debug('Пользователь не имеет telegram_id или verified email, пропускаем уведомление', user_id=user.id)
         return False
+
+    async def _maybe_send_site_notification(
+        self, user: User, notification_type: NotificationType, context: dict[str, Any]
+    ) -> None:
+        """Best-effort fan-out to the recovery-portal site's bell + Web Push.
+
+        Silently does nothing for notification types without a mapping in
+        _build_site_notification_content -- an unrecognised type is
+        skipped rather than shown to the user with meaningless filler
+        text. Never raises: this runs as a detached task (see caller) and
+        must not surface as an unhandled-task-exception log spam.
+        """
+        try:
+            content = _build_site_notification_content(notification_type, context)
+            if not content:
+                return
+            title, body, deep_link = content
+
+            from app.services.site_push_service import deliver_site_notification
+
+            await deliver_site_notification(
+                user_id=user.id,
+                notification_type=notification_type.value,
+                title=title,
+                body=body,
+                deep_link=deep_link,
+            )
+        except Exception as e:
+            logger.debug('Site notification/push fan-out failed', user_id=user.id, error=e)
 
     async def _send_telegram_notification(
         self,
@@ -744,6 +779,56 @@ class NotificationDeliveryService:
             telegram_message=telegram_message,
             telegram_markup=telegram_markup,
         )
+
+
+def _build_site_notification_content(
+    notification_type: NotificationType, context: dict[str, Any]
+) -> tuple[str, str, str | None] | None:
+    """Map a subset of NotificationType values to (title, body, deep_link)
+    for the recovery-portal site's bell + Web Push (see
+    NotificationDeliveryService._maybe_send_site_notification).
+
+    Deliberately not exhaustive -- only types meaningful to a user who may
+    have no Telegram account at all (site-trial/email-only visitors are
+    exactly who this is for). Returns None for anything unmapped so an
+    unrecognised type is silently skipped rather than shown with
+    meaningless filler text.
+    """
+    cabinet_url = settings.CABINET_URL
+
+    if notification_type == NotificationType.SUBSCRIPTION_EXPIRING:
+        return (
+            'Подписка скоро закончится',
+            f"Осталось {context.get('days_left', '?')} дн. Действует до {context.get('expires_at', '')}.",
+            f'{cabinet_url}/subscription',
+        )
+    if notification_type == NotificationType.SUBSCRIPTION_EXPIRED:
+        return (
+            'Подписка закончилась',
+            'Продлите подписку, чтобы не потерять доступ к VPN.',
+            f'{cabinet_url}/subscription',
+        )
+    if notification_type == NotificationType.BALANCE_TOPUP:
+        return (
+            'Баланс пополнен',
+            f"+{context.get('formatted_amount', '')}. Новый баланс: {context.get('formatted_balance', '')}.",
+            f'{cabinet_url}/balance',
+        )
+    if notification_type == NotificationType.AUTOPAY_SUCCESS:
+        return (
+            'Автоплатёж прошёл успешно',
+            f"Списано {context.get('formatted_amount', '')}, подписка продлена до "
+            f"{context.get('new_expires_at', '')}.",
+            f'{cabinet_url}/subscription',
+        )
+    if notification_type == NotificationType.AUTOPAY_FAILED:
+        return ('Автоплатёж не прошёл', 'Проверьте баланс или привязанную карту.', f'{cabinet_url}/balance')
+    if notification_type == NotificationType.BAN_NOTIFICATION:
+        return ('Аккаунт заблокирован', 'Обратитесь в поддержку, если считаете это ошибкой.', None)
+    if notification_type == NotificationType.UNBAN_NOTIFICATION:
+        return ('Аккаунт разблокирован', 'Доступ восстановлен.', None)
+
+    return None
 
 
 # Singleton instance

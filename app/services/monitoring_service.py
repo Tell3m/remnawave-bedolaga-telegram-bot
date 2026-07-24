@@ -2368,7 +2368,7 @@ class MonitoringService:
             sent_count = 0
             for subscription in subscriptions:
                 user = subscription.user
-                if not user or not user.telegram_id:
+                if not user:
                     continue
 
                 if not is_traffic_warning_enabled(user):
@@ -2394,6 +2394,37 @@ class MonitoringService:
                         continue
                 except Exception:
                     pass
+
+                if not user.telegram_id:
+                    # Email-only/site-trial user -- no bot to message.
+                    # Previously this whole check just `continue`d past
+                    # them (see the `if not user or not user.telegram_id`
+                    # guard this replaced), so they never got a traffic
+                    # warning of any kind. Route through the site bell +
+                    # Web Push instead, added 24.07.2026.
+                    try:
+                        from app.services.site_push_service import deliver_site_notification
+
+                        await deliver_site_notification(
+                            user_id=user.id,
+                            notification_type='traffic_warning',
+                            title='Трафик почти закончился',
+                            body=(
+                                f'Использовано {traffic_used:.1f} из {traffic_limit} ГБ '
+                                f'({current_percent:.0f}%).'
+                            ),
+                            deep_link=f'{settings.CABINET_URL}/subscription',
+                        )
+                        await cache.set(cache_key_str, '1', expire=86400)
+                        sent_count += 1
+                    except Exception as send_error:
+                        logger.debug(
+                            'Failed to send site traffic warning',
+                            user_id=user.id,
+                            subscription_id=subscription.id,
+                            error=send_error,
+                        )
+                    continue
 
                 try:
                     language = getattr(user, 'language', 'ru') or 'ru'

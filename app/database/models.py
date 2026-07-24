@@ -3645,6 +3645,62 @@ class WebAuthnCredential(Base):
         return f'<WebAuthnCredential id={self.id} user_id={self.user_id}>'
 
 
+class SiteNotification(Base):
+    """A notification shown in the recovery-portal site's bell/notification
+    center (see app/cabinet/routes/site_notifications.py). Written by
+    NotificationDeliveryService.send_notification() and the traffic-warning
+    check in monitoring_service.py for any user reachable this way,
+    regardless of whether they also have a Telegram account -- this table
+    is the only place a per-user notification's *text* is persisted
+    (the existing notification_log table only records that something was
+    sent, not what).
+    """
+
+    __tablename__ = 'site_notifications'
+    __table_args__ = (Index('ix_site_notifications_user_created', 'user_id', 'created_at'),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    type = Column(String(64), nullable=False)
+    title = Column(String(200), nullable=False)
+    body = Column(Text, nullable=False)
+    deep_link = Column(String(500), nullable=True)
+    created_at = Column(AwareDateTime(), default=func.now())
+    read_at = Column(AwareDateTime(), nullable=True)
+
+    user = relationship('User', backref='site_notifications')
+
+    def __repr__(self) -> str:
+        return f'<SiteNotification id={self.id} user_id={self.user_id} type={self.type}>'
+
+
+class PushSubscription(Base):
+    """A Web Push subscription (browser endpoint + encryption keys) for the
+    recovery-portal site, registered via the Push API after the visitor
+    grants notification permission. One row per browser/device the
+    visitor opted into push on; `endpoint` is unique per browser
+    installation (the push service assigns it), so re-subscribing the
+    same browser updates the existing row instead of duplicating it.
+    """
+
+    __tablename__ = 'push_subscriptions'
+    __table_args__ = (Index('ix_push_subscriptions_user', 'user_id'),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    endpoint = Column(String(500), unique=True, nullable=False, index=True)
+    p256dh_key = Column(String(255), nullable=False)
+    auth_key = Column(String(255), nullable=False)
+    user_agent = Column(String(300), nullable=True)
+    created_at = Column(AwareDateTime(), default=func.now())
+    last_used_at = Column(AwareDateTime(), nullable=True)
+
+    user = relationship('User', backref='push_subscriptions')
+
+    def __repr__(self) -> str:
+        return f'<PushSubscription id={self.id} user_id={self.user_id}>'
+
+
 # ==================== FORTUNE WHEEL ====================
 
 

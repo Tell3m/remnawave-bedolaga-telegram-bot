@@ -167,7 +167,9 @@ class BroadcastService:
                 await session.commit()
 
             # _fetch_recipients теперь возвращает list[int] (telegram_id), а не ORM-объекты
-            recipient_ids: list[int] = await self._fetch_recipients(config.target, config.category)
+            recipient_ids: list[int] = await self._fetch_recipients(
+                config.target, config.category, message_text=config.message_text
+            )
 
             async with AsyncSessionLocal() as session:
                 broadcast = await session.get(BroadcastHistory, broadcast_id)
@@ -233,12 +235,21 @@ class BroadcastService:
             logger.exception('Критическая ошибка при выполнении рассылки', broadcast_id=broadcast_id, exc=exc)
             await self._mark_failed(broadcast_id, sent_count, failed_count, blocked_count)
 
-    async def _fetch_recipients(self, target: str, category: str = 'system') -> list[int]:
+    async def _fetch_recipients(
+        self, target: str, category: str = 'system', *, message_text: str | None = None
+    ) -> list[int]:
         """Загружает получателей и возвращает список telegram_id (скаляры, не ORM-объекты).
 
         Filters out users who disabled the given broadcast category in their
         notification preferences (news_enabled, promo_offers_enabled).
         Category 'system' is never filtered — system notifications reach everyone.
+
+        Also fans this broadcast out to the recovery-portal site's bell +
+        Web Push for EVERY matched user, not just the ones with telegram_id
+        returned below -- an admin promo/news broadcast previously reached
+        Telegram users only; email-only/site-trial-only users got nothing
+        at all from this admin panel (added 24.07.2026, see
+        _fanout_to_site_notifications).
         """
         async with AsyncSessionLocal() as session:
             if target.startswith('custom_'):
@@ -258,9 +269,46 @@ class BroadcastService:
                 users_orm = [u for u in users_orm if is_promo_offers_enabled(u)]
             # category == 'system' → no filtering, sent to everyone
 
+            # Fan out to the site bell + Web Push for every matched user
+            # (telegram_id or not) -- fire-and-forget, must never block or
+            # fail this broadcast's actual Telegram delivery below.
+            if message_text:
+                user_ids = [u.id for u in users_orm]
+                asyncio.create_task(
+                    self._fanout_to_site_notifications(user_ids, category=category, message_text=message_text)
+                )
+
             # Извлекаем telegram_id сразу, пока сессия жива.
             # После выхода из блока ORM-объекты станут detached.
             return [u.telegram_id for u in users_orm if u.telegram_id is not None]
+
+    async def _fanout_to_site_notifications(self, user_ids: list[int], *, category: str, message_text: str) -> None:
+        """Best-effort site bell + Web Push fan-out for an admin broadcast.
+
+        See _fetch_recipients' docstring for why this exists. Never raises.
+        """
+        import re
+
+        from app.services.site_push_service import deliver_site_notification
+
+        title = {
+            'promo': 'Специальное предложение',
+            'news': 'Новости',
+        }.get(category, 'Уведомление')
+        body = re.sub(r'<[^>]+>', '', message_text).strip()
+        if not body:
+            return
+
+        for user_id in user_ids:
+            try:
+                await deliver_site_notification(
+                    user_id=user_id,
+                    notification_type=f'broadcast_{category}',
+                    title=title,
+                    body=body,
+                )
+            except Exception as e:
+                logger.debug('Site notification fan-out failed for broadcast recipient', user_id=user_id, error=e)
 
     async def _send_batched(
         self,

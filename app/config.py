@@ -1126,6 +1126,14 @@ class Settings(BaseSettings):
         ''  # Comma-separated IPs/CIDRs of trusted reverse proxies (e.g. '127.0.0.1,10.0.0.0/8')
     )
 
+    # Web Push (VAPID) for the recovery-portal site's notification bell.
+    # Generate once with `vapid --gen` or `python -m pywebpush` and never
+    # rotate casually -- rotating invalidates every browser's existing
+    # subscription (they'd all need to re-subscribe).
+    SITE_PUSH_VAPID_PUBLIC_KEY: str = ''
+    SITE_PUSH_VAPID_PRIVATE_KEY: str = ''
+    SITE_PUSH_VAPID_SUBJECT: str = 'mailto:admin@hotspotforme.shop'
+
     # OAuth 2.0 provider settings for cabinet
     OAUTH_GOOGLE_CLIENT_ID: str = ''
     OAUTH_GOOGLE_CLIENT_SECRET: str = ''

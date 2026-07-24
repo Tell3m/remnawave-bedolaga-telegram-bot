@@ -26,12 +26,18 @@ auth.py. One code-based flow for the whole site auth surface, instead of
 Multi-signal device abuse check: a visitor who simply clears browser
 storage gets a fresh client-generated device_id, silently defeating a
 device_id-only check on a second claim from the same physical device. No
-single signal is trusted alone -- see _compute_abuse_signal_count -- a
-claim is only blocked when at least 2 of {device_id match, FingerprintJS
-match, IP-subnet already produced a trial} agree, so clearing just one of
-them (the common case) still gets caught by the other two, while a false
-positive on any single signal (two different phones sharing a fingerprint,
-two strangers sharing a CGNAT IP) never blocks a real visitor on its own.
+single signal is trusted alone -- see _is_device_abuse_blocked -- and
+device_id is required to be one of the matches: a claim is blocked only
+when device_id agrees with an already-used trial AND at least one of
+{FingerprintJS match, IP-subnet already produced a trial} also agrees.
+(Tightened 24.07.2026 -- previously any 2 of the 3 signals could trigger a
+block, including FingerprintJS+IP-subnet agreeing with no device_id match
+at all; that combo risked blocking a real visitor on pure coincidence,
+e.g. two different phones of the same common model/browser sharing both
+a fingerprint and a CGNAT IP. Anchoring on device_id keeps the same
+resistance to a cleared/reset device_id being defeated by itself, while a
+false positive on FingerprintJS or IP-subnet alone still never blocks
+anyone by itself.)
 
 Intentionally unauthenticated -- mirrors the pattern in site_verification.py.
 """
@@ -102,8 +108,7 @@ router = APIRouter(prefix='/public/site-trial', tags=['Cabinet:Public'])
 
 DEVICE_LIMIT_MESSAGE = 'Похоже, с этого устройства уже активировали пробную подписку. Купите подписку 😊'
 
-# Signals must be independently corroborated -- see module docstring.
-ABUSE_SIGNAL_BLOCK_THRESHOLD = 2
+# device_id anchors the check, plus >=1 more signal -- see module docstring.
 
 # WebAuthn (Face ID/Touch ID/Windows Hello) is scoped to this one static
 # site's own origin -- the passkey is created and used by the *browser*
@@ -230,32 +235,31 @@ async def _find_exact_trial_conflict(
     return result.scalars().first()
 
 
-async def _compute_abuse_signal_count(
+async def _is_device_abuse_blocked(
     db: AsyncSession,
     *,
     device_id: str | None,
     fingerprint: str | None,
     client_ip: str,
     email_lower: str,
-) -> int:
-    """How many of {device_id, fingerprint, IP-subnet} point at an already-used trial.
+) -> bool:
+    """device_id match required, plus >=1 of {fingerprint, IP-subnet} agreeing.
 
-    Each signal is weak alone (device_id/fingerprint clear on browser reset
-    or reinstall; an IP subnet can be shared by many unrelated real
-    visitors behind CGNAT/Wi-Fi) -- callers only block once
-    ABUSE_SIGNAL_BLOCK_THRESHOLD of them agree.
+    device_id is the most reliable of the three signals, so it anchors the
+    check -- a fingerprint or IP-subnet match alone (each weak on its own,
+    see module docstring) never blocks by itself.
     """
-    count = 0
+    if not device_id:
+        return False
 
-    if device_id:
-        conflict = await _find_exact_trial_conflict(db, User.site_trial_device_id, device_id, email_lower)
-        if conflict and conflict.is_trial_already_used():
-            count += 1
+    device_conflict = await _find_exact_trial_conflict(db, User.site_trial_device_id, device_id, email_lower)
+    if not (device_conflict and device_conflict.is_trial_already_used()):
+        return False
 
     if fingerprint:
         conflict = await _find_exact_trial_conflict(db, User.site_trial_fingerprint, fingerprint, email_lower)
         if conflict and conflict.is_trial_already_used():
-            count += 1
+            return True
 
     subnet_user_ids = await get_subnet_trial_user_ids(client_ip)
     if subnet_user_ids:
@@ -269,9 +273,9 @@ async def _compute_abuse_signal_count(
             )
         )
         if any(u.is_trial_already_used() for u in result.scalars().all()):
-            count += 1
+            return True
 
-    return count
+    return False
 
 
 def _validate_claim_prerequisites(email: str) -> None:
@@ -319,10 +323,9 @@ async def request_site_trial_code(
 
     # Fail fast on device abuse -- no point mailing a code that verification
     # will refuse to honour anyway.
-    signal_count = await _compute_abuse_signal_count(
+    if await _is_device_abuse_blocked(
         db, device_id=device_id, fingerprint=fingerprint, client_ip=client_ip, email_lower=email_lower
-    )
-    if signal_count >= ABUSE_SIGNAL_BLOCK_THRESHOLD:
+    ):
         return SiteTrialRequestCodeResponse(status='device_limit', message=DEVICE_LIMIT_MESSAGE)
 
     # An email that already has a subscription isn't claiming a NEW trial --
@@ -409,10 +412,9 @@ async def verify_site_trial_code(
     # Re-check abuse signals at activation time too (defense in depth
     # against a second tab/device racing the same email through
     # request-code, or a fingerprint that only became available after it).
-    signal_count = await _compute_abuse_signal_count(
+    if await _is_device_abuse_blocked(
         db, device_id=device_id, fingerprint=fingerprint, client_ip=client_ip, email_lower=email_lower
-    )
-    if signal_count >= ABUSE_SIGNAL_BLOCK_THRESHOLD:
+    ):
         return SiteTrialClaimResponse(status='device_limit', message=DEVICE_LIMIT_MESSAGE)
 
     user, _created = await _get_or_create_site_trial_user(db, email_lower, device_id, fingerprint)
