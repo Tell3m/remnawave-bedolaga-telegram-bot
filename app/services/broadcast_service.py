@@ -274,7 +274,15 @@ class BroadcastService:
             # fail this broadcast's actual Telegram delivery below.
             if message_text:
                 user_ids = [u.id for u in users_orm]
-                asyncio.create_task(
+                # Routed through fire_and_forget() (not a bare create_task)
+                # so the task isn't garbage-collected before it runs -- a
+                # bare create_task() with no other referrer can vanish
+                # before its first await point, which is exactly why no
+                # admin broadcast ever produced a site_notifications row
+                # in production (found 24.07.2026).
+                from app.services.site_push_service import fire_and_forget
+
+                fire_and_forget(
                     self._fanout_to_site_notifications(user_ids, category=category, message_text=message_text)
                 )
 

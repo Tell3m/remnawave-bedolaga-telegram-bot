@@ -31,6 +31,23 @@ from app.database.models import PushSubscription, SiteNotification
 
 logger = structlog.get_logger(__name__)
 
+# asyncio only holds a *weak* reference to a Task once it's scheduled --
+# a bare `asyncio.create_task(...)` whose return value isn't stored
+# anywhere can be garbage-collected before it ever runs, silently
+# dropping the notification. Every fire-and-forget call site in this
+# codebase (notification_delivery_service, broadcast_service) must route
+# through fire_and_forget() below instead of calling create_task directly,
+# so the task has a strong referrer until it finishes. Root-caused
+# 24.07.2026: production had zero rows in site_notifications despite the
+# feature having shipped days earlier -- this GC race is why.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def fire_and_forget(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
 
 async def deliver_site_notification(
     *,

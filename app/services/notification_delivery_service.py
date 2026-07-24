@@ -166,7 +166,12 @@ class NotificationDeliveryService:
         # of which branch below actually handles this user (Telegram and
         # site push are not mutually exclusive, see docstring), and must
         # never slow down or fail the primary delivery attempted below.
-        asyncio.create_task(self._maybe_send_site_notification(user, notification_type, context))
+        # Routed through fire_and_forget() (not a bare create_task) so the
+        # task isn't garbage-collected before it runs -- see that helper's
+        # docstring in site_push_service.py.
+        from app.services.site_push_service import fire_and_forget
+
+        fire_and_forget(self._maybe_send_site_notification(user, notification_type, context))
 
         if user.telegram_id:
             # User has Telegram - send via bot

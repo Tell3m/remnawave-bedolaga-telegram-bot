@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot_factory import create_bot
+from app.config import settings
 from app.database.crud.discount_offer import (
     count_discount_offers,
     list_discount_offers,
@@ -514,6 +515,50 @@ async def _send_promo_notifications(
     return sent, failed
 
 
+async def _send_site_promo_notifications(
+    targets: list[tuple[int, int]],
+    *,
+    message_text: str | None,
+    discount_percent: int,
+    bonus_amount_kopeks: int,
+    valid_hours: int,
+) -> None:
+    """Fan out a promo/discount offer to the site bell + Web Push.
+
+    Separate from _send_promo_notifications (Telegram-only, bot.send_message
+    with a claim button) -- this admin surface never reached site-trial/
+    email-only users at all before, since notify_targets there is filtered
+    down to (telegram_id, offer_id) and dropped anyone without a
+    telegram_id. targets here is (user_id, offer_id) for *every* recipient
+    of the offer, not just the Telegram-reachable ones (added 24.07.2026).
+    Never raises: same best-effort contract as deliver_site_notification
+    itself, and this already runs detached (see _schedule_promo_notifications).
+    """
+    from app.services.site_push_service import deliver_site_notification
+
+    if not targets:
+        return
+
+    body = message_text or _build_default_promo_message(
+        discount_percent=discount_percent,
+        bonus_amount_kopeks=bonus_amount_kopeks,
+        valid_hours=valid_hours,
+    )
+    deep_link = settings.CABINET_URL or None
+
+    for user_id, _offer_id in targets:
+        try:
+            await deliver_site_notification(
+                user_id=user_id,
+                notification_type='promo_offer',
+                title='Специальное предложение',
+                body=body,
+                deep_link=deep_link,
+            )
+        except Exception as exc:
+            logger.debug('Site notification fan-out failed for promo offer recipient', user_id=user_id, error=exc)
+
+
 @router.post('/broadcast', response_model=PromoOfferBroadcastResponse, status_code=status.HTTP_201_CREATED)
 async def broadcast_offer(
     payload: PromoOfferBroadcastRequest,
@@ -593,12 +638,16 @@ async def broadcast_offer(
     notify_targets = [
         (recipient.telegram_id, offer.id) for recipient, offer in offers_to_notify if recipient.telegram_id
     ]
+    # Same, but keyed by user_id for *every* recipient (not just Telegram-reachable
+    # ones) -- feeds the site bell/push fan-out below, which email/site-trial-only
+    # users need since they have no telegram_id for notify_targets to catch them.
+    site_notify_targets = [(recipient.id, offer.id) for recipient, offer in offers_to_notify]
 
     # Send Telegram notifications if requested
     notifications_sent = 0
     notifications_failed = 0
 
-    if payload.send_notification and notify_targets:
+    if payload.send_notification:
         # Render placeholders in custom message text
         rendered_message_text = payload.message_text
         if rendered_message_text:
@@ -614,26 +663,40 @@ async def broadcast_offer(
             except (KeyError, ValueError, IndexError):
                 logger.warning('Failed to render promo message placeholders')
 
-        notify_kwargs = {
-            'message_text': rendered_message_text,
-            'button_text': payload.button_text,
-            'discount_percent': payload.discount_percent,
-            'bonus_amount_kopeks': payload.bonus_amount_kopeks,
-            'valid_hours': payload.valid_hours,
-        }
+        if notify_targets:
+            notify_kwargs = {
+                'message_text': rendered_message_text,
+                'button_text': payload.button_text,
+                'discount_percent': payload.discount_percent,
+                'bonus_amount_kopeks': payload.bonus_amount_kopeks,
+                'valid_hours': payload.valid_hours,
+            }
 
-        if len(notify_targets) <= _SYNC_NOTIFY_LIMIT:
-            # Small batch: send inline so exact sent/failed counts come back immediately.
-            notifications_sent, notifications_failed = await _send_promo_notifications(notify_targets, **notify_kwargs)
-        else:
-            # Mass broadcast: a synchronous fan-out to thousands of users overruns the
-            # proxy timeout — the cabinet showed an error while the offers were already
-            # committed and notifications kept sending (Telegram bug #652234). Detach it:
-            # the request returns now with created_offers; delivery is observable via /logs.
-            _schedule_promo_notifications(_send_promo_notifications(notify_targets, **notify_kwargs))
-            logger.info(
-                'Promo broadcast: notifications dispatched in background',
-                recipients=len(notify_targets),
+            if len(notify_targets) <= _SYNC_NOTIFY_LIMIT:
+                # Small batch: send inline so exact sent/failed counts come back immediately.
+                notifications_sent, notifications_failed = await _send_promo_notifications(
+                    notify_targets, **notify_kwargs
+                )
+            else:
+                # Mass broadcast: a synchronous fan-out to thousands of users overruns the
+                # proxy timeout — the cabinet showed an error while the offers were already
+                # committed and notifications kept sending (Telegram bug #652234). Detach it:
+                # the request returns now with created_offers; delivery is observable via /logs.
+                _schedule_promo_notifications(_send_promo_notifications(notify_targets, **notify_kwargs))
+                logger.info(
+                    'Promo broadcast: notifications dispatched in background',
+                    recipients=len(notify_targets),
+                )
+
+        if site_notify_targets:
+            _schedule_promo_notifications(
+                _send_site_promo_notifications(
+                    site_notify_targets,
+                    message_text=rendered_message_text,
+                    discount_percent=payload.discount_percent,
+                    bonus_amount_kopeks=payload.bonus_amount_kopeks,
+                    valid_hours=payload.valid_hours,
+                )
             )
 
     return PromoOfferBroadcastResponse(
