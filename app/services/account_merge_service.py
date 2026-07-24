@@ -39,6 +39,7 @@ from app.database.models import (
     PromoCodeUse,
     PromoOfferLog,
     PromoOfferTemplate,
+    PushSubscription,
     ReferralContest,
     ReferralContestEvent,
     ReferralEarning,
@@ -46,6 +47,7 @@ from app.database.models import (
     SavedPaymentMethod,
     SentNotification,
     SeverPayPayment,
+    SiteNotification,
     Subscription,
     SubscriptionConversion,
     SubscriptionEvent,
@@ -61,6 +63,7 @@ from app.database.models import (
     UserRole,
     UserStatus,
     WataPayment,
+    WebAuthnCredential,
     WelcomeText,
     WheelSpin,
     WithdrawalRequest,
@@ -957,6 +960,30 @@ async def execute_merge(
         update(GuestPurchase).where(GuestPurchase.buyer_user_id == secondary.id).values(buyer_user_id=primary.id)
     )
     await db.execute(update(GuestPurchase).where(GuestPurchase.user_id == secondary.id).values(user_id=primary.id))
+
+    # 10t. Переназначение сайтовых passkeys/push-подписок/истории уведомлений
+    # (site_trial.py, site_push.py) на primary -- добавлено 24.07.2026. Без
+    # этого шага WebAuthnCredential секонда становится нерабочим "мёртвым"
+    # Face ID сразу после мержа: secondary.status станет DELETED и
+    # secondary.email будет обнулён ниже (шаг 14), а webauthn_login_complete
+    # проверяет ровно оба этих поля на связанном user_id -- физический
+    # passkey в Keychain телефона продолжает существовать и предлагаться
+    # системой, но сервер отвечает 401 "Account not active", хотя сама
+    # запись WebAuthnCredential никуда не делась (FK ondelete='CASCADE'
+    # сработал бы только при реальном DELETE строки пользователя, а не при
+    # soft-delete через status). Не переносим CabinetRefreshToken (см. шаг
+    # 11 ниже) -- это осознанно: старая сессия должна быть отозвана, чтобы
+    # заставить пройти повторную проверку владения email/аккаунтом после
+    # мержа, а не потому что перенос технически невозможен.
+    await db.execute(
+        update(WebAuthnCredential).where(WebAuthnCredential.user_id == secondary.id).values(user_id=primary.id)
+    )
+    await db.execute(
+        update(PushSubscription).where(PushSubscription.user_id == secondary.id).values(user_id=primary.id)
+    )
+    await db.execute(
+        update(SiteNotification).where(SiteNotification.user_id == secondary.id).values(user_id=primary.id)
+    )
 
     # 11. Инвалидация refresh-токенов обоих пользователей (после мержа будет создан новый)
     now = datetime.now(UTC)
