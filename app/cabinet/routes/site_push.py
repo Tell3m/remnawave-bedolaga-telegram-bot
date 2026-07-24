@@ -149,6 +149,31 @@ async def mark_site_notifications_read(
     return {'status': 'ok'}
 
 
+class SiteNotificationDismissRequest(BaseModel):
+    refresh_token: str = Field(..., description="The site session's refresh token")
+    notification_id: int = Field(..., description="The notification to remove from the visitor's list")
+
+
+@router.post('/notifications/dismiss')
+async def dismiss_site_notification(
+    request: SiteNotificationDismissRequest,
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Removes one notification from the bell's list -- the "X" on an
+    already-read item. A real delete, not a soft dismiss flag: nothing
+    else reads SiteNotification rows once they've been shown here, so
+    there's no history view this would need to preserve for.
+    """
+    user_id = await _resolve_site_session_user_id(db, request.refresh_token)
+    await db.execute(
+        delete(SiteNotification).where(
+            SiteNotification.id == request.notification_id, SiteNotification.user_id == user_id
+        )
+    )
+    await db.commit()
+    return {'status': 'ok'}
+
+
 @router.get('/push/vapid-public-key')
 async def get_push_vapid_public_key():
     """Public -- this key is meant to be embedded in the site's JS, it is
