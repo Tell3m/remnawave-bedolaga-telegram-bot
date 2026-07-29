@@ -374,11 +374,17 @@ async def _load_landing_tariffs(
         return []
 
     result = await db.execute(
-        select(Tariff)
-        .where(Tariff.id.in_(allowed_ids), Tariff.is_active.is_(True))
-        .order_by(Tariff.display_order, Tariff.id)
+        select(Tariff).where(Tariff.id.in_(allowed_ids), Tariff.is_active.is_(True))
     )
     tariffs = result.scalars().all()
+    # Preserve the admin-configured allowed_tariff_ids order (this is what
+    # QuickPurchase.tsx auto-selects as the default tariff -- "first in the
+    # list") instead of the tariffs' global display_order, which reflects
+    # their ordering elsewhere in the cabinet (admin panel, full tariff
+    # picker) and has no reason to match what a given landing wants shown
+    # first.
+    order_index = {tariff_id: position for position, tariff_id in enumerate(allowed_ids)}
+    tariffs = sorted(tariffs, key=lambda t: order_index.get(t.id, len(allowed_ids)))
 
     allowed_periods = landing.allowed_periods or {}
     landing_tariffs = []
