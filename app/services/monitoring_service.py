@@ -386,6 +386,7 @@ class MonitoringService:
                 await self._check_expired_subscription_followups(db)
                 await self._check_traffic_warnings(db)
                 await self._check_low_balance_alerts(db)
+                await self._check_account_link_hints(db)
                 await self._retry_stuck_guest_purchases(db)
                 await self._cleanup_expired_refresh_tokens(db)
                 await self._cleanup_inactive_users(db)
@@ -2463,6 +2464,108 @@ class MonitoringService:
 
         except Exception as error:
             logger.error('Error checking traffic warnings', error=error)
+
+    async def _check_account_link_hints(self, db: AsyncSession):
+        """One-time nudge to link the other identity (site <-> Telegram).
+
+        Two symmetric audiences, each told to attach the identifier they're
+        missing before they end up creating a genuine second account (the
+        failure mode this replaces -- see the Gajurus1 duplicate-account
+        incident 02.08.2026, two separate users/subscriptions for the same
+        person because nothing ever suggested linking Telegram to the site
+        account or vice versa). Persistent per-user gate via
+        account_link_hint_sent_at (migration 0099), not the 24h cache used
+        for traffic/balance warnings -- "missing telegram_id"/"missing
+        email" doesn't resolve on its own, so a time-based cache would just
+        re-nag forever.
+
+        Delayed 24h past registration so it doesn't fire mid-signup before
+        someone's had a chance to add both naturally, and capped per cycle
+        so a first deploy against the existing user base trickles out
+        instead of messaging everyone at once.
+        """
+        try:
+            from app.services.site_push_service import deliver_site_notification
+
+            cutoff = datetime.now(UTC) - timedelta(hours=24)
+            accounts_url = f'{settings.CABINET_URL}/profile/accounts'
+            sent_count = 0
+
+            # Group A: site/email users with no Telegram linked -- reachable
+            # only via the site bell (no telegram_id to message).
+            result = await db.execute(
+                select(User)
+                .where(
+                    User.status == UserStatus.ACTIVE.value,
+                    User.telegram_id.is_(None),
+                    User.email.isnot(None),
+                    User.email_verified.is_(True),
+                    User.account_link_hint_sent_at.is_(None),
+                    User.created_at < cutoff,
+                )
+                .limit(50)
+            )
+            for user in result.scalars().all():
+                try:
+                    await deliver_site_notification(
+                        user_id=user.id,
+                        notification_type='account_link_hint',
+                        title='Добавьте Telegram',
+                        body=(
+                            'Вы входите через сайт. Если также пользуетесь нашим '
+                            'Telegram-ботом — привяжите его в Профиле → '
+                            '«Привязанные аккаунты», иначе там будет отдельный '
+                            'аккаунт без вашей подписки.'
+                        ),
+                        deep_link=accounts_url,
+                    )
+                    user.account_link_hint_sent_at = datetime.now(UTC)
+                    sent_count += 1
+                except Exception as send_error:
+                    logger.debug('Failed to send account-link hint (site)', user_id=user.id, error=send_error)
+
+            # Group B: Telegram users with no email linked -- message them
+            # directly through the bot; the site bell fan-out below also
+            # reaches them if they open the Telegram mini-app.
+            if self.bot:
+                result = await db.execute(
+                    select(User)
+                    .where(
+                        User.status == UserStatus.ACTIVE.value,
+                        User.telegram_id.isnot(None),
+                        User.email.is_(None),
+                        User.account_link_hint_sent_at.is_(None),
+                        User.created_at < cutoff,
+                    )
+                    .limit(50)
+                )
+                message = (
+                    '🔗 Совет: привяжите email или аккаунт с сайта в Профиле → '
+                    '«Привязанные аккаунты». Это защитит доступ, если Telegram '
+                    'станет недоступен, и объединит покупки в одном аккаунте, '
+                    'если вы уже пользовались сайтом отдельно.'
+                )
+                for user in result.scalars().all():
+                    try:
+                        await self._send_message_with_logo(user.telegram_id, message, user=user)
+                        await deliver_site_notification(
+                            user_id=user.id,
+                            notification_type='account_link_hint',
+                            title='Привяжите email',
+                            body=message,
+                            deep_link=accounts_url,
+                        )
+                        user.account_link_hint_sent_at = datetime.now(UTC)
+                        sent_count += 1
+                    except Exception as send_error:
+                        logger.debug('Failed to send account-link hint (telegram)', user_id=user.id, error=send_error)
+
+            if sent_count > 0:
+                await db.commit()
+                logger.info('Account-link hints sent', sent_count=sent_count)
+
+        except Exception as error:
+            logger.error('Error checking account-link hints', error=error)
 
     async def _check_low_balance_alerts(self, db: AsyncSession):
         """Check users with autopay enabled who have low balance and notify them.

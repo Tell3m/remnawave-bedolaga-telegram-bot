@@ -1935,6 +1935,12 @@ class User(Base):
     password_reset_token = Column(String(255), nullable=True)
     password_reset_expires = Column(AwareDateTime(), nullable=True)
     cabinet_last_login = Column(AwareDateTime(), nullable=True)
+    # One-time "link your other account" nudge (site users -> attach
+    # Telegram, Telegram-only users -> attach email) -- see monitoring_service
+    # ._check_account_link_hints. Set once sent so the periodic monitoring
+    # cycle never re-sends it; NULL means "not yet sent" (or resolved, since
+    # the check also skips users who already have both identifiers).
+    account_link_hint_sent_at = Column(AwareDateTime(), nullable=True)
     # Campaign slug saved at registration, consumed at email verification
     pending_campaign_slug = Column(String(64), nullable=True)
     # Email change fields
