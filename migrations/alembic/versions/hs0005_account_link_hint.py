@@ -10,8 +10,8 @@ conditions (expiring subscription etc.) -- unlike those, "no telegram_id"/
 periodic monitoring cycle would re-send this hint to the same users on
 every restart of the bot process forever.
 
-Revision ID: 0099
-Revises: 0098
+Revision ID: hs0005
+Revises: hs0004
 Create Date: 2026-08-02
 """
 
@@ -21,8 +21,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision: str = '0099'
-down_revision: Union[str, None] = '0098'
+revision: str = 'hs0005'
+down_revision: Union[str, None] = 'hs0004'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

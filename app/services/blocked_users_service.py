@@ -310,6 +310,20 @@ class BlockedUsersService:
 
             user_display = user.telegram_id or user.email or f'#{user.id}'
 
+            # Best-effort: stop Platega SBP autopay for every subscription of
+            # this user before anything is deleted — the platega_subscriptions
+            # record CASCADE-deletes with its subscription below, so cancelling
+            # afterwards would find nothing to cancel on Platega's side and the
+            # user keeps getting charged for a deleted account. This path has
+            # no grace-access guard (unlike UserService.delete_user_account), so
+            # a plain best-effort cancel loop is enough — no lock to re-acquire.
+            from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
+            from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
+
+            for sub in getattr(user, 'subscriptions', None) or []:
+                await cancel_platega_recurring_for_subscription_safe(db, sub.id)
+
+                await cancel_lava_recurring_for_subscription_safe(db, sub.id)
             # Удаляем связанные записи (порядок важен из-за foreign keys)
 
             # 1. Платежные системы (до транзакций, т.к. ссылаются на них)
@@ -422,6 +436,26 @@ class BlockedUsersService:
 
         for i, user_result in enumerate(blocked_users):
             try:
+                if action in (
+                    BlockedUserAction.DELETE_FROM_REMNAWAVE,
+                    BlockedUserAction.DELETE_FROM_DB,
+                    BlockedUserAction.DELETE_BOTH,
+                ):
+                    from app.services.grace_access_runtime import (
+                        GraceAccessDeletionBlocked,
+                        ensure_no_open_grace_for_user,
+                    )
+
+                    try:
+                        await ensure_no_open_grace_for_user(db, user_result.user_id)
+                    except GraceAccessDeletionBlocked:
+                        result.errors.append(
+                            f'Удаление {user_result.telegram_id} пропущено: сначала завершите grace-доступ'
+                        )
+                        if progress_callback:
+                            await progress_callback(i + 1, total)
+                        continue
+
                 if action in (BlockedUserAction.DELETE_FROM_REMNAWAVE, BlockedUserAction.DELETE_BOTH):
                     uuids_to_delete = user_result.remnawave_uuids or (
                         [user_result.remnawave_uuid] if user_result.remnawave_uuid else []
@@ -436,6 +470,11 @@ class BlockedUsersService:
                             )
                         # Задержка для избежания rate limit
                         await asyncio.sleep(self.API_DELAY_SECONDS)
+
+                    if action == BlockedUserAction.DELETE_FROM_REMNAWAVE:
+                        # Release the pre-delete advisory/SQLite write guard;
+                        # this action intentionally makes no database changes.
+                        await db.rollback()
 
                 if action in (BlockedUserAction.DELETE_FROM_DB, BlockedUserAction.DELETE_BOTH):
                     success = await self.delete_user_from_db(db, user_result.user_id)

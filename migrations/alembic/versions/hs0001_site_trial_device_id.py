@@ -8,8 +8,8 @@ under different emails. This column stores a client-generated, localStorage-
 persisted device id at first-claim time so a later claim attempt from a
 DIFFERENT email but the SAME device can be recognized and blocked.
 
-Revision ID: 0095
-Revises: 0094
+Revision ID: hs0001
+Revises: 0103
 Create Date: 2026-07-22
 """
 
@@ -19,8 +19,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision: str = '0095'
-down_revision: Union[str, None] = '0094'
+revision: str = 'hs0001'
+down_revision: Union[str, None] = '0103'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

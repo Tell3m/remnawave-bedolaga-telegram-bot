@@ -494,6 +494,13 @@ async def _handle_subscription_merge(
         if primary.remnawave_uuid:
             deferred_remnawave_deletions.append(primary.remnawave_uuid)
             primary.remnawave_uuid = None
+        # СБП-автопродление Platega удаляемой подписки отменяем ДО delete: CASCADE
+        # снесёт локальную запись, и Platega продолжила бы списывать в никуда.
+        from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
+        from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
+
+        await cancel_platega_recurring_for_subscription_safe(db, primary_sub.id, commit=False)
+        await cancel_lava_recurring_for_subscription_safe(db, primary_sub.id, commit=False)
         # Явно удаляем subscription_servers перед подпиской (CASCADE настроен, но делаем явно для ясности)
         await db.execute(delete(SubscriptionServer).where(SubscriptionServer.subscription_id == primary_sub.id))
         # Удаляем запись подписки primary
@@ -520,6 +527,12 @@ async def _handle_subscription_merge(
         if secondary.remnawave_uuid:
             deferred_remnawave_deletions.append(secondary.remnawave_uuid)
             secondary.remnawave_uuid = None
+        # СБП-автопродление Platega удаляемой подписки отменяем ДО delete (см. выше).
+        from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
+        from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
+
+        await cancel_platega_recurring_for_subscription_safe(db, secondary_sub.id, commit=False)
+        await cancel_lava_recurring_for_subscription_safe(db, secondary_sub.id, commit=False)
         # Явно удаляем subscription_servers перед подпиской (CASCADE настроен, но делаем явно для ясности)
         await db.execute(delete(SubscriptionServer).where(SubscriptionServer.subscription_id == secondary_sub.id))
         # Удаляем запись подписки secondary
@@ -590,6 +603,12 @@ async def execute_merge(
     # Два прохода: сначала очищаем secondary (flush для освобождения unique constraint),
     # затем устанавливаем на primary. Без этого SQLAlchemy может отправить UPDATE primary
     # раньше UPDATE secondary, что вызовет UniqueViolation.
+    # A merge can move or delete subscriptions and panel UUIDs. Keep the
+    # snapshot owner stable until every open grace overlay is restored.
+    from app.services.grace_access_runtime import ensure_no_open_grace_for_users
+
+    await ensure_no_open_grace_for_users(db, (primary_user_id, secondary_user_id))
+
     oauth_transfers: list[tuple[str, object]] = []
     for field in _OAUTH_FIELDS:
         secondary_value = getattr(secondary, field)

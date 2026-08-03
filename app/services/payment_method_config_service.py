@@ -263,6 +263,16 @@ def _get_method_defaults() -> dict:
                 {'id': 'sbp', 'name': 'СБП'},
             ],
         },
+        'cispay': {
+            'default_display_name': settings.get_cispay_display_name(),
+            'is_configured': settings.is_cispay_enabled(),
+            'default_min': settings.CISPAY_MIN_AMOUNT_KOPEKS,
+            'default_max': settings.CISPAY_MAX_AMOUNT_KOPEKS,
+            'available_sub_options': [
+                {'id': 'card', 'name': 'Карта'},
+                {'id': 'sbp', 'name': 'СБП'},
+            ],
+        },
     }
 
 
@@ -324,6 +334,7 @@ DEFAULT_METHOD_ORDER = [
     'jupiter',
     'donut',
     'lava',
+    'cispay',
 ]
 
 
@@ -348,8 +359,9 @@ def normalize_quick_amounts(values: list | None) -> list[int] | None:
         unique.add(value)
     if len(unique) > MAX_QUICK_AMOUNTS:
         raise ValueError(f'quick_amounts cannot have more than {MAX_QUICK_AMOUNTS} items')
-    if not unique:
-        return None
+    # Пустой список — валидное значение «кнопки отключены», НЕ схлопываем в None
+    # (None = «использовать дефолты»). Кабинетный фронт для сброса шлёт явный
+    # флаг reset_quick_amounts, а не пустой список.
     return sorted(unique)
 
 
@@ -358,7 +370,8 @@ def get_effective_quick_amounts(
     min_amount_kopeks: int,
     max_amount_kopeks: int,
 ) -> list[int]:
-    source = quick_amounts or DEFAULT_QUICK_AMOUNTS
+    # None → дефолты; [] → админ отключил кнопки быстрых сумм (пустой результат)
+    source = DEFAULT_QUICK_AMOUNTS if quick_amounts is None else quick_amounts
     return [amount for amount in source if min_amount_kopeks <= amount <= max_amount_kopeks]
 
 

@@ -16,6 +16,7 @@ from app.database.crud.server_squad import (
 from app.database.crud.subscription import (
     add_subscription_servers,
     create_paid_subscription,
+    should_carry_trial_remaining_days,
 )
 from app.database.crud.subscription_conversion import (
     create_subscription_conversion,
@@ -28,6 +29,7 @@ from app.services.subscription_service import SubscriptionService
 from app.utils.pricing_utils import (
     apply_percentage_discount,
     calculate_months_from_days,
+    calculate_price_per_month,
     format_period_description,
     validate_pricing_calculation,
 )
@@ -391,7 +393,7 @@ class MiniAppSubscriptionPurchaseService:
                 else None
             )
 
-            per_month_price = base_price // months if months else base_price
+            per_month_price = calculate_price_per_month(base_price, period_days)
             per_month_price_label = texts.format_price(per_month_price)
 
             traffic_config = self._build_traffic_config(
@@ -934,7 +936,7 @@ class MiniAppSubscriptionPurchaseService:
                 'Not enough funds on balance',
             )
 
-        per_month_price = pricing.final_total // pricing.months if pricing.months else pricing.final_total
+        per_month_price = calculate_price_per_month(pricing.final_total, pricing.selection.period.days)
 
         return {
             'total_price_kopeks': pricing.final_total,
@@ -1077,7 +1079,7 @@ class MiniAppSubscriptionPurchaseService:
             if subscription.is_trial:
                 was_trial_conversion = True
                 trial_duration = (now - subscription.start_date).days
-                if settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID and subscription.end_date:
+                if should_carry_trial_remaining_days() and subscription.end_date:
                     remaining = subscription.end_date - now
                     if remaining.total_seconds() > 0:
                         bonus_period = remaining

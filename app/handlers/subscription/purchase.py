@@ -14,6 +14,7 @@ from app.database.crud.subscription import (
     create_paid_subscription,
     create_pending_trial_subscription,
     create_trial_subscription,
+    should_carry_trial_remaining_days,
 )
 from app.database.crud.transaction import create_transaction
 from app.database.crud.user import subtract_user_balance
@@ -35,7 +36,7 @@ from app.keyboards.inline import (
     get_trial_keyboard,
     get_updated_subscription_settings_keyboard,
 )
-from app.localization.texts import get_texts
+from app.localization.texts import Texts, get_texts
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.pricing_engine import pricing_engine
 from app.services.remnawave_service import RemnaWaveConfigurationError
@@ -118,6 +119,9 @@ from app.utils.timezone import format_local_datetime
 
 from .autopay import (
     handle_autopay_menu,
+    handle_sbp_recurring_cancel,
+    handle_sbp_recurring_enable,
+    handle_sbp_recurring_menu,
     handle_subscription_cancel,
     handle_subscription_config_back,
     set_autopay_days,
@@ -363,7 +367,7 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
                     f'<b>📦 {html.escape(tariff.name)}</b>',
                     f'Тип: {tariff_type_str}',
                     f'Трафик: {tariff.traffic_limit_gb} ГБ' if tariff.traffic_limit_gb > 0 else 'Трафик: ∞ Безлимит',
-                    f'Устройства: {tariff.device_limit}',
+                    f'Устройства: {Texts.format_device_limit(tariff.device_limit)}',
                 ]
 
                 if is_daily:
@@ -474,7 +478,7 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
             '',
         )
 
-    device_limit_display = str(subscription.device_limit)
+    device_limit_display = Texts.format_device_limit(subscription.device_limit)
 
     message = message_template.format(
         full_name=html.escape(db_user.full_name or ''),
@@ -1809,7 +1813,7 @@ async def handle_extend_subscription(
     ]
 
     if settings.is_devices_selection_enabled():
-        renewal_lines.append(f'📱 Устройств: {subscription.device_limit}')
+        renewal_lines.append(f'📱 Устройств: {Texts.format_device_limit(subscription.device_limit)}')
 
     renewal_lines.extend(
         [
@@ -2459,7 +2463,7 @@ async def confirm_purchase(callback: types.CallbackQuery, state: FSMContext, db_
 
                 trial_duration = (current_time - existing_subscription.start_date).days
 
-                if settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID and existing_subscription.end_date:
+                if should_carry_trial_remaining_days() and existing_subscription.end_date:
                     remaining_trial_delta = existing_subscription.end_date - current_time
                     if remaining_trial_delta.total_seconds() > 0:
                         bonus_period = remaining_trial_delta
@@ -2974,7 +2978,7 @@ async def handle_subscription_settings(callback: types.CallbackQuery, db_user: U
             '',
         )
 
-    devices_limit_display = str(subscription.device_limit)
+    devices_limit_display = Texts.format_device_limit(subscription.device_limit)
 
     settings_text = settings_template.format(
         countries_count=len(subscription.connected_squads or []),
@@ -4209,6 +4213,12 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(show_autopay_days, F.data == 'autopay_set_days')
 
     dp.callback_query.register(show_autopay_period, F.data == 'autopay_set_period')
+
+    dp.callback_query.register(handle_sbp_recurring_menu, F.data == 'sbp_recurring_menu')
+
+    dp.callback_query.register(handle_sbp_recurring_enable, F.data == 'sbp_recurring_enable')
+
+    dp.callback_query.register(handle_sbp_recurring_cancel, F.data == 'sbp_recurring_cancel')
 
     dp.callback_query.register(handle_subscription_config_back, F.data == 'subscription_config_back')
 

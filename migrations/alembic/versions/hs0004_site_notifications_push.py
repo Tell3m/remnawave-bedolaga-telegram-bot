@@ -7,8 +7,8 @@ endpoint + encryption keys registered after the visitor grants
 notification permission. Both are written by NotificationDeliveryService
 and the traffic-warning check in monitoring_service.py.
 
-Revision ID: 0098
-Revises: 0097
+Revision ID: hs0004
+Revises: hs0003
 Create Date: 2026-07-24
 """
 
@@ -18,8 +18,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision: str = '0098'
-down_revision: Union[str, None] = '0097'
+revision: str = 'hs0004'
+down_revision: Union[str, None] = 'hs0003'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

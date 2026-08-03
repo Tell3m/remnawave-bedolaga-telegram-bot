@@ -9,8 +9,8 @@ partition than Safari, so the visitor is asked for email/OTP again even
 though nothing about their account changed -- a passkey survives that
 because it lives in the device's Keychain, not site storage.
 
-Revision ID: 0097
-Revises: 0096
+Revision ID: hs0003
+Revises: hs0002
 Create Date: 2026-07-24
 """
 
@@ -20,8 +20,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision: str = '0097'
-down_revision: Union[str, None] = '0096'
+revision: str = 'hs0003'
+down_revision: Union[str, None] = 'hs0002'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

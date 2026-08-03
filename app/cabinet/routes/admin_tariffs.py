@@ -131,6 +131,7 @@ async def list_tariffs(
                 is_trial_available=tariff.is_trial_available,
                 is_daily=tariff.is_daily,
                 daily_price_kopeks=tariff.daily_price_kopeks,
+                lava_product_id=tariff.lava_product_id,
                 allow_traffic_topup=tariff.allow_traffic_topup,
                 show_in_gift=tariff.show_in_gift,
                 traffic_limit_gb=tariff.traffic_limit_gb,
@@ -267,6 +268,7 @@ async def get_tariff(
         # Дневной тариф
         is_daily=tariff.is_daily,
         daily_price_kopeks=tariff.daily_price_kopeks,
+        lava_product_id=tariff.lava_product_id,
         # Режим сброса трафика
         traffic_reset_mode=tariff.traffic_reset_mode,
         # Внешний сквад
@@ -325,6 +327,7 @@ async def create_new_tariff(
         # Дневной тариф
         is_daily=request.is_daily,
         daily_price_kopeks=request.daily_price_kopeks,
+        lava_product_id=request.lava_product_id,
         # Режим сброса трафика
         traffic_reset_mode=request.traffic_reset_mode,
         # Внешний сквад
@@ -419,6 +422,8 @@ async def update_existing_tariff(
     # Дневной тариф
     if request.is_daily is not None:
         updates['is_daily'] = request.is_daily
+    if request.lava_product_id is not None:
+        updates['lava_product_id'] = request.lava_product_id.strip() or None
     if request.daily_price_kopeks is not None:
         updates['daily_price_kopeks'] = request.daily_price_kopeks
     # Режим сброса трафика (None допускается как значение для сброса к глобальной настройке)
@@ -648,6 +653,8 @@ async def _background_sync_squads(tariff_id: int, admin_id: int) -> None:
             new_squads = tariff.allowed_squads or []
             ext_squad_uuid = tariff.external_squad_uuid
 
+            from app.services.grace_access_runtime import update_panel_user_grace_safe
+
             service = RemnaWaveService()
             updated = 0
             failed = 0
@@ -666,7 +673,9 @@ async def _background_sync_squads(tariff_id: int, admin_id: int) -> None:
                         return
                     async with semaphore:
                         try:
-                            await api.update_user(
+                            await update_panel_user_grace_safe(
+                                api,
+                                sub.id,
                                 uuid=remnawave_uuid,
                                 active_internal_squads=new_squads,
                                 external_squad_uuid=ext_squad_uuid,
@@ -750,6 +759,7 @@ async def sync_tariff_squads(
     ext_squad_uuid = tariff.external_squad_uuid
 
     # Sync to Remnawave panel with concurrency limit and circuit breaker
+    from app.services.grace_access_runtime import update_panel_user_grace_safe
     from app.services.remnawave_service import RemnaWaveService
 
     service = RemnaWaveService()
@@ -787,7 +797,9 @@ async def sync_tariff_squads(
                     return 'skipped'
 
                 try:
-                    await api.update_user(
+                    await update_panel_user_grace_safe(
+                        api,
+                        sub.id,
                         uuid=remnawave_uuid,
                         active_internal_squads=new_squads,
                         external_squad_uuid=ext_squad_uuid,

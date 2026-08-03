@@ -1254,8 +1254,14 @@ def get_subscription_keyboard(
                         )
                     )
                 else:
-                    # Для суточных тарифов переходим на список тарифов, для обычных - мгновенное переключение
-                    tariff_callback = 'tariff_switch' if is_daily_tariff else 'instant_switch'
+                    # Для суточных тарифов переходим на список тарифов, для обычных - мгновенное переключение.
+                    # Бесплатный (0₽) тариф — тоже через список с выбором периода: prorated
+                    # instant-switch посчитал бы доплату за весь остаток бесплатных дней
+                    # и перенёс бы их на платный тариф вопреки TARIFF_SWITCH_RESET_FREE_DAYS.
+                    is_free_tariff = bool(
+                        tariff and getattr(tariff, 'is_free', False) and settings.TARIFF_SWITCH_RESET_FREE_DAYS
+                    )
+                    tariff_callback = 'tariff_switch' if (is_daily_tariff or is_free_tariff) else 'instant_switch'
                     settings_row.append(
                         InlineKeyboardButton(
                             text=texts.t('CHANGE_TARIFF_BUTTON', '📦 Тариф'), callback_data=tariff_callback
@@ -2131,10 +2137,11 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
 
     if settings.is_lava_card_enabled():
         lava_card_name = settings.get_lava_card_display_name()
+        lava_name = settings.get_lava_display_name()
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    text=texts.t('PAYMENT_LAVA_CARD', f'💳 {lava_card_name}'),
+                    text=texts.t('PAYMENT_LAVA_CARD', f'💳 {lava_card_name} - через {lava_name}'),
                     callback_data=_build_callback('lava_card'),
                 )
             ]
@@ -2143,10 +2150,11 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
 
     if settings.is_lava_sbp_enabled():
         lava_sbp_name = settings.get_lava_sbp_display_name()
+        lava_name = settings.get_lava_display_name()
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    text=texts.t('PAYMENT_LAVA_SBP', f'📱 {lava_sbp_name}'),
+                    text=texts.t('PAYMENT_LAVA_SBP', f'📱 {lava_sbp_name} - через {lava_name}'),
                     callback_data=_build_callback('lava_sbp'),
                 )
             ]
@@ -2160,6 +2168,42 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
                 InlineKeyboardButton(
                     text=texts.t('PAYMENT_LAVA', f'🌋 {lava_name}'),
                     callback_data=_build_callback('lava'),
+                )
+            ]
+        )
+        has_direct_payment_methods = True
+
+    if settings.is_cispay_card_enabled():
+        cispay_card_name = settings.get_cispay_card_display_name()
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('PAYMENT_CISPAY_CARD', f'💳 {cispay_card_name}'),
+                    callback_data=_build_callback('cispay_card'),
+                )
+            ]
+        )
+        has_direct_payment_methods = True
+
+    if settings.is_cispay_sbp_enabled():
+        cispay_sbp_name = settings.get_cispay_sbp_display_name()
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('PAYMENT_CISPAY_SBP', f'📱 {cispay_sbp_name}'),
+                    callback_data=_build_callback('cispay_sbp'),
+                )
+            ]
+        )
+        has_direct_payment_methods = True
+
+    if settings.is_cispay_enabled() and not settings.is_cispay_card_enabled() and not settings.is_cispay_sbp_enabled():
+        cispay_name = settings.get_cispay_display_name()
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('PAYMENT_CISPAY', f'💳 {cispay_name}'),
+                    callback_data=_build_callback('cispay'),
                 )
             ]
         )
@@ -2680,8 +2724,12 @@ def get_change_devices_keyboard(
     else:
         max_devices = settings.MAX_DEVICES_LIMIT if settings.MAX_DEVICES_LIMIT > 0 else 100
 
-    # Минимум при уменьшении всегда 1 (device_limit тарифа — это "включено при покупке", а не нижняя граница)
-    min_devices = 1
+    # По умолчанию ниже включённого в тариф опускать нельзя — кнопки с меньшими
+    # значениями просто не показываем (ALLOW_DEVICES_BELOW_TARIFF_LIMIT=True
+    # возвращает прежний минимум 1).
+    from app.utils.subscription_utils import resolve_min_device_limit
+
+    min_devices = resolve_min_device_limit(tariff)
 
     start_range = max(min_devices, min(current_devices - 3, max_devices - 6))
     end_range = min(max_devices + 1, max(current_devices + 4, 7))
